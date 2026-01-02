@@ -19,7 +19,7 @@ SYMBOL_CONFIG = {
         "leverage": 150,
     },
     "SOLINR": {
-        "qty": 0.05,
+        "qty": 0.5,
         "leverage": 100,
     },
 }
