@@ -6,6 +6,23 @@ import time
 import requests
 from dotenv import load_dotenv
 
+# =========================
+# SYMBOL CONFIG (MUST BE ABOVE CLASS)
+# =========================
+SYMBOL_CONFIG = {
+    "ETHINR": {
+        "qty": 0.02,
+        "leverage": 150,
+    },
+    "BTCINR": {
+        "qty": 0.002,
+        "leverage": 150,
+    },
+    "SOLINR": {
+        "qty": 0.05,
+        "leverage": 100,
+    },
+}
 
 # =========================
 # SIGNATURE
@@ -34,22 +51,18 @@ class TradingBot:
         if not self.api_key or not self.secret_key:
             raise Exception("❌ API KEYS NOT FOUND")
 
-        # ===== SETTINGS =====
-        self.symbol = "ETHINR"
-        self.qty = 0.02
-        self.leverage = 150
+        # ===== GLOBAL SETTINGS =====
         self.drop_percent = 0.75
         self.target_percent = 0.5
         self.max_buys = 8
         self.max_margin_usage = 0.6
-        self.min_liq_buffer = .002
+        self.min_liq_buffer = 0.2
 
-        self.next_avg_price = 0.0
         self.balance = self.get_user_balance()
+        self.next_avg_price = {}
 
-        print("\n🚀 BOT STARTED")
-        print(f"Balance: {self.balance:.2f} INR")
-        print("⚠️ MODE: 150× LEVERAGE (EXTREME RISK)\n")
+        print("\n🚀 MULTI-SYMBOL BOT STARTED")
+        print(f"Balance: {self.balance:.2f} INR\n")
 
     # =========================
     # FETCH BALANCE
@@ -68,12 +81,12 @@ class TradingBot:
         return float(res.json()["inrBalance"])
 
     # =========================
-    # FETCH POSITION (API ONLY)
+    # FETCH POSITION
     # =========================
-    def get_position(self):
+    def get_position(self, symbol):
         timestamp = str(int(time.time() * 1000))
         params = {
-            "symbol": self.symbol,
+            "symbol": symbol,
             "timestamp": timestamp,
             "pageSize": 50,
             "sortOrder": "desc",
@@ -90,82 +103,73 @@ class TradingBot:
         res.raise_for_status()
 
         for pos in res.json():
-            if pos["contractPair"] == self.symbol and float(pos["quantity"]) > 0:
+            if pos["contractPair"] == symbol and float(pos["quantity"]) > 0:
                 return {
                     "qty": float(pos["quantity"]),
                     "avg": float(pos["entryPrice"]),
                     "liq": float(pos["liquidationPrice"]),
                 }
-
         return None
 
     # =========================
-    # PLACE ORDER (PRINT RESPONSE)
+    # PLACE ORDER
     # =========================
-    def place_order(self, side):
+    def place_order(self, symbol, side, qty):
         timestamp = str(int(time.time() * 1000))
 
         payload = {
             "timestamp": timestamp,
             "placeType": "ORDER_FORM",
-            "quantity": self.qty,
+            "quantity": qty,
             "side": side,
-            "symbol": self.symbol,
+            "symbol": symbol,
             "type": "MARKET",
             "marginAsset": "INR",
             "deviceType": "WEB",
             "userCategory": "EXTERNAL",
-            'reduceOnly': False, 
+            "reduceOnly": False,
         }
 
         signature = generate_signature(
             self.secret_key, json.dumps(payload, separators=(",", ":"))
         )
 
-        response = requests.post(
+        res = requests.post(
             f"{self.base_url}/v1/order/place-order",
             json=payload,
             headers={"api-key": self.api_key, "signature": signature},
         )
 
-        try:
-            data = response.json()
-        except Exception:
-            print("❌ NON-JSON RESPONSE:", response.text)
-            return None
-
-        print("\n📨 ORDER RESPONSE")
-        print(json.dumps(data, indent=2))
-        return data
+        print(f"\n📨 {symbol} {side} RESPONSE")
+        print(json.dumps(res.json(), indent=2))
 
     # =========================
-    # CLOSE ALL POSITIONS
+    # CLOSE SYMBOL POSITION
     # =========================
-    def close_all(self):
+    def close_symbol(self, symbol):
         timestamp = str(int(time.time() * 1000))
-        payload = {"timestamp": timestamp}
+        payload = {"timestamp": timestamp, "symbol": symbol}
 
         signature = generate_signature(
             self.secret_key, json.dumps(payload, separators=(",", ":"))
         )
 
-        response = requests.delete(
-            f"{self.base_url}/v1/positions/close-all-positions",
+        res = requests.delete(
+            f"{self.base_url}/v1/positions/close-position",
             json=payload,
             headers={"api-key": self.api_key, "signature": signature},
         )
 
-        print("\n📨 CLOSE RESPONSE")
-        print(json.dumps(response.json(), indent=2))
-        return response.json()
+        print(f"\n❌ CLOSED {symbol}")
+        print(json.dumps(res.json(), indent=2))
 
     # =========================
-    # FETCH LIVE PRICE
+    # FETCH PRICE
     # =========================
-    def fetch_price(self):
+    def fetch_price(self, symbol):
         res = requests.post(
             f"{self.market_url}/v1/market/klines",
-            json={"pair": self.symbol, "interval": "1m", "limit": 1},
+            json={"pair": symbol, "interval": "1m", "limit": 1},
         )
         res.raise_for_status()
         return float(res.json()[-1]["close"])
@@ -173,47 +177,29 @@ class TradingBot:
     # =========================
     # STRATEGY
     # =========================
-    def get_signal(self, price, position):
+    def get_signal(self, symbol, price, position, qty):
         if not position:
             return "buy"
 
-        qty = position["qty"]
-        avg = position["avg"]
-        liq = position["liq"]
-
-        buy_count = int(qty / self.qty)
+        buy_count = int(position["qty"] / qty)
 
         if buy_count >= self.max_buys:
             return "hold"
 
-        liq_gap = (price - liq) / price * 100
+        liq_gap = (price - position["liq"]) / price * 100
         if liq_gap < self.min_liq_buffer:
-            print("🚨 LIQUIDATION TOO CLOSE")
             return "hold"
 
-        self.next_avg_price = avg * (1 - (self.drop_percent / 100) * buy_count)
+        next_price = position["avg"] * (1 - (self.drop_percent / 100) * buy_count)
+        self.next_avg_price[symbol] = next_price
 
-        if price < self.next_avg_price:
+        if price < next_price:
             return "buy"
 
-        if price > avg * (1 + self.target_percent / 100):
+        if price > position["avg"] * (1 + self.target_percent / 100):
             return "sell"
 
         return "hold"
-
-    # =========================
-    # EXECUTE TRADE
-    # =========================
-    def execute_trade(self, signal, price):
-        if signal == "buy":
-            margin_needed = (self.qty * price) / self.leverage
-            if margin_needed > self.balance * self.max_margin_usage:
-                print("⚠️ Margin limit reached")
-                return
-            self.place_order("BUY")
-
-        elif signal == "sell":
-            self.close_all()
 
     # =========================
     # MAIN LOOP
@@ -221,22 +207,32 @@ class TradingBot:
     def run(self):
         while True:
             try:
-                price = self.fetch_price()
                 self.balance = self.get_user_balance()
-                position = self.get_position()
 
-                signal = self.get_signal(price, position)
-                self.execute_trade(signal, price)
+                for symbol, cfg in SYMBOL_CONFIG.items():
+                    qty = cfg["qty"]
+                    leverage = cfg["leverage"]
 
-                print(
-                    f"Price={price:.2f} | "
-                    f"Qty={position['qty'] if position else 0} | "
-                    f"Avg={position['avg'] if position else 0} | "
-                    f"Liq={position['liq'] if position else None} | "
-                    f"Balance={self.balance:.2f} | "
-                    f"Signal={signal} | "
-                    f"NextAvg={self.next_avg_price}"
-                )
+                    price = self.fetch_price(symbol)
+                    position = self.get_position(symbol)
+                    signal = self.get_signal(symbol, price, position, qty)
+
+                    if signal == "buy":
+                        margin_needed = (qty * price) / leverage
+                        if margin_needed < self.balance * self.max_margin_usage:
+                            self.place_order(symbol, "BUY", qty)
+
+                    elif signal == "sell":
+                        self.close_symbol(symbol)
+
+                    print(
+                        f"{symbol} | Price={price:.2f} | "
+                        f"Qty={position['qty'] if position else 0} | "
+                        f"Avg={position['avg'] if position else 0} | "
+                        f"Liq={position['liq'] if position else 0} | "
+                        f"Signal={signal} | "
+                        f"Next Avg={self.next_avg_price.get(symbol, 'N/A')}"
+                    )
 
                 time.sleep(10)
 
