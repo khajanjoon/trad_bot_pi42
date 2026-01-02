@@ -9,3 +9,4 @@ icecream
 requests
 python-dotenv
 scipy
+paho-mqtt
