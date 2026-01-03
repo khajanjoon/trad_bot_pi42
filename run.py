@@ -23,6 +23,9 @@ SYMBOL_CONFIG = {
     "BTCINR": {"qty": 0.002, "leverage": 150},
     "SOLINR": {"qty": 0.5, "leverage": 100},
     "LTCINR": {"qty": 0.7, "leverage": 50},
+    "BNBINR": {"qty": 0.05, "leverage": 75},
+    "BCHINR": {"qty": 0.07, "leverage": 50},
+    "ZECINR": {"qty": 0.1, "leverage": 40},
 }
 
 # =========================
