@@ -10,10 +10,13 @@ import paho.mqtt.client as mqtt
 # =========================
 # MQTT CONFIG
 # =========================
-MQTT_BROKER = "45.120.136.157"          # change if needed
+MQTT_BROKER = "45.120.136.157"
 MQTT_PORT = 1883
-MQTT_TOPIC = "pi42/account"
 MQTT_CLIENT_ID = "pi42_trading_bot"
+
+HA_PREFIX = "homeassistant"
+DEVICE_ID = "pi42_trading_bot"
+STATE_TOPIC = "pi42/account/state"
 
 # =========================
 # SYMBOL CONFIG
@@ -64,14 +67,18 @@ class TradingBot:
 
         self.next_avg_price = {}
 
-        # ===== MQTT SETUP (paho-mqtt v2.x FIXED) =====
+        # ===== MQTT SETUP (v2.x FIX) =====
         self.mqtt_client = mqtt.Client(
             client_id=MQTT_CLIENT_ID,
             protocol=mqtt.MQTTv311,
             callback_api_version=mqtt.CallbackAPIVersion.VERSION1,
         )
+
         self.mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
         self.mqtt_client.loop_start()
+
+        # ===== HOME ASSISTANT DISCOVERY =====
+        self.publish_ha_discovery()
 
         # ===== INITIAL BALANCE =====
         bal = self.get_user_balance()
@@ -79,11 +86,40 @@ class TradingBot:
         self.pnl_isolated = bal["pnl_isolated"]
         self.pnl_cross = bal["pnl_cross"]
 
-        print("\n🚀 MULTI-SYMBOL BOT STARTED")
+        print("\n🚀 PI42 MULTI-SYMBOL BOT STARTED")
         print(f"Wallet Balance: {self.balance:.2f} INR")
         print(f"PnL Isolated: {self.pnl_isolated:.2f} INR\n")
 
-        self.publish_mqtt_balance()
+    # =========================
+    # HOME ASSISTANT DISCOVERY
+    # =========================
+    def publish_ha_discovery(self):
+        device = {
+            "identifiers": [DEVICE_ID],
+            "name": "PI42 Trading Bot",
+            "manufacturer": "PI42",
+            "model": "Futures Averaging Bot",
+        }
+
+        sensors = [
+            ("wallet_balance", "PI42 Wallet Balance", "INR", "mdi:wallet"),
+            ("pnl_isolated", "PI42 Isolated PnL", "INR", "mdi:chart-line"),
+            ("pnl_cross", "PI42 Cross PnL", "INR", "mdi:chart-areaspline"),
+        ]
+
+        for key, name, unit, icon in sensors:
+            topic = f"{HA_PREFIX}/sensor/{DEVICE_ID}_{key}/config"
+            payload = {
+                "name": name,
+                "state_topic": STATE_TOPIC,
+                "value_template": f"{{{{ value_json.{key} }}}}",
+                "unit_of_measurement": unit,
+                "unique_id": f"{DEVICE_ID}_{key}",
+                "icon": icon,
+                "device": device,
+            }
+
+            self.mqtt_client.publish(topic, json.dumps(payload), qos=1, retain=True)
 
     # =========================
     # FETCH BALANCE
@@ -104,16 +140,12 @@ class TradingBot:
 
         return {
             "inr_balance": float(data.get("inrBalance", 0)),
-            "wallet_balance": float(data.get("walletBalance", 0)),
-            "withdrawable_balance": float(data.get("withdrawableBalance", 0)),
-            "margin_balance": float(data.get("marginBalance", 0)),
-            "locked_balance": float(data.get("lockedBalance", 0)),
-            "pnl_cross": float(data.get("unrealisedPnlCross", 0)),
             "pnl_isolated": float(data.get("unrealisedPnlIsolated", 0)),
+            "pnl_cross": float(data.get("unrealisedPnlCross", 0)),
         }
 
     # =========================
-    # MQTT PUBLISH
+    # MQTT STATE PUBLISH
     # =========================
     def publish_mqtt_balance(self):
         payload = {
@@ -124,7 +156,7 @@ class TradingBot:
         }
 
         self.mqtt_client.publish(
-            MQTT_TOPIC,
+            STATE_TOPIC,
             json.dumps(payload),
             qos=1,
             retain=False,
@@ -139,7 +171,6 @@ class TradingBot:
             "symbol": symbol,
             "timestamp": timestamp,
             "pageSize": 50,
-            "sortOrder": "desc",
         }
 
         query = "&".join(f"{k}={v}" for k, v in params.items())
@@ -160,39 +191,6 @@ class TradingBot:
                     "liq": float(pos["liquidationPrice"]),
                 }
         return None
-
-    # =========================
-    # PLACE ORDER
-    # =========================
-    def place_order(self, symbol, side, qty, price):
-        timestamp = str(int(time.time() * 1000))
-
-        payload = {
-            "timestamp": timestamp,
-            "placeType": "ORDER_FORM",
-            "quantity": qty,
-            "side": side,
-            "symbol": symbol,
-            "type": "MARKET",
-            "takeProfitPrice": int(price * (1 + self.target_percent / 100)),
-            "marginAsset": "INR",
-            "deviceType": "WEB",
-            "userCategory": "EXTERNAL",
-            "reduceOnly": False,
-        }
-
-        signature = generate_signature(
-            self.secret_key, json.dumps(payload, separators=(",", ":"))
-        )
-
-        res = requests.post(
-            f"{self.base_url}/v1/order/place-order",
-            json=payload,
-            headers={"api-key": self.api_key, "signature": signature},
-        )
-
-        print(f"\n📨 {symbol} BUY RESPONSE")
-        print(json.dumps(res.json(), indent=2))
 
     # =========================
     # FETCH PRICE
@@ -221,9 +219,41 @@ class TradingBot:
             return "hold"
 
         next_price = position["avg"] * (1 - (self.drop_percent / 100) * buy_count)
-        self.next_avg_price[symbol] = next_price
+        self.next_avg_price[symbol] = round(next_price, 2)
 
         return "buy" if price < next_price else "hold"
+
+    # =========================
+    # PLACE ORDER
+    # =========================
+    def place_order(self, symbol, qty, price):
+        timestamp = str(int(time.time() * 1000))
+
+        payload = {
+            "timestamp": timestamp,
+            "placeType": "ORDER_FORM",
+            "quantity": qty,
+            "side": "BUY",
+            "symbol": symbol,
+            "type": "MARKET",
+            "takeProfitPrice": int(price * (1 + self.target_percent / 100)),
+            "marginAsset": "INR",
+            "deviceType": "WEB",
+            "reduceOnly": False,
+        }
+
+        signature = generate_signature(
+            self.secret_key, json.dumps(payload, separators=(",", ":"))
+        )
+
+        res = requests.post(
+            f"{self.base_url}/v1/order/place-order",
+            json=payload,
+            headers={"api-key": self.api_key, "signature": signature},
+        )
+
+        print(f"\n📨 {symbol} BUY ORDER")
+        print(json.dumps(res.json(), indent=2))
 
     # =========================
     # MAIN LOOP
@@ -249,16 +279,15 @@ class TradingBot:
                     if signal == "buy":
                         margin_needed = (qty * price) / leverage
                         if margin_needed < self.balance * self.max_margin_usage:
-                            self.place_order(symbol, "BUY", qty, price)
+                            self.place_order(symbol, qty, price)
 
                     print(
-                        f"Wallet={self.balance:.2f} | "
                         f"{symbol} | Price={price:.2f} | "
                         f"Qty={position['qty'] if position else 0} | "
                         f"Avg={position['avg'] if position else 0} | "
                         f"Liq={position['liq'] if position else 0} | "
-                        f"Signal={signal}"
-                        f"Next Avg={self.next_avg_price.get(symbol, 'N/A')}"
+                        f"Signal={signal} | "
+                        f"NextAvg={self.next_avg_price.get(symbol, 'N/A')}"
                     )
 
                 time.sleep(10)
