@@ -139,16 +139,9 @@ class TradingBot:
         self.last_update_time = datetime.now()
         self.is_running = True
         
-        # Enhanced caching with safety
-        self.positions_cache = {}
-        self.prices_cache = {}
-        self.known_positions = {}  # Track positions we know exist
+        # Simple tracking
         self.api_error_count = 0
         self.max_api_errors = 5
-        
-        # Cache timeouts
-        self.position_cache_timeout = 10  # Increased from 5
-        self.price_cache_timeout = 3
         
         # ===== RATE LIMITERS =====
         self.api_limiter = RateLimiter(calls_per_second=1.0)
@@ -233,26 +226,6 @@ class TradingBot:
             
             if res.status_code == 200:
                 positions = res.json()
-                current_time = time.time()
-                
-                # Cache positions for all symbols
-                for symbol in SYMBOL_CONFIG.keys():
-                    position_found = None
-                    for pos in positions:
-                        if pos.get("contractPair") == symbol and float(pos.get("quantity", 0)) > 0:
-                            position_found = {
-                                "qty": float(pos.get("quantity", 0)),
-                                "avg": float(pos.get("entryPrice", 0)),
-                                "liq": float(pos.get("liquidationPrice", 0)),
-                                "leverage": float(pos.get("leverage", 1)),
-                                "unrealized_pnl": float(pos.get("unrealisedPnl", 0)),
-                            }
-                            # Store in known positions
-                            self.known_positions[symbol] = position_found
-                            break
-                    
-                    self.positions_cache[symbol] = (position_found, current_time)
-                    
                 print(f"Loaded {len([p for p in positions if float(p.get('quantity', 0)) > 0])} positions")
                 return True
             else:
@@ -438,143 +411,67 @@ class TradingBot:
             pass
     
     # =========================
-    # POSITION MANAGEMENT - SAFE VERSION
+    # POSITION MANAGEMENT - DIRECT API VERSION
     # =========================
-    def get_position(self, symbol: str, force_refresh: bool = False) -> Optional[Dict]:
+    def get_position(self, symbol: str) -> Optional[Dict]:
         """
-        Safe position fetching with fallback logic.
-        Returns None only if we're sure there's no position.
+        Fetch position directly from API without caching.
+        Returns None if no position exists.
         """
-        current_time = time.time()
-        
-        # Check if we know this symbol has a position
-        if symbol in self.known_positions and not force_refresh:
-            # Return known position from cache if recent
-            if symbol in self.positions_cache:
-                cached_data, cache_time = self.positions_cache[symbol]
-                if current_time - cache_time < self.position_cache_timeout:
-                    return cached_data
-        
-        # Try to fetch from API with retry
-        position_data = self._fetch_position_with_retry(symbol)
-        
-        if position_data:
-            # Update caches
-            self.positions_cache[symbol] = (position_data, current_time)
-            self.known_positions[symbol] = position_data
-            return position_data
-        else:
-            # API failed, check if we previously knew about a position
-            if symbol in self.known_positions:
-                print(f"⚠️ {symbol}: API failed, using last known position")
-                return self.known_positions[symbol]
+        try:
+            self.api_limiter.wait()
+            timestamp = str(int(time.time() * 1000))
             
-            # No known position and API failed
-            self.positions_cache[symbol] = (None, current_time)
+            # Try to get position for specific symbol
+            params = {"symbol": symbol, "timestamp": timestamp, "pageSize": 10}
+            query = "&".join(f"{k}={v}" for k, v in params.items())
+            signature = generate_signature(self.secret_key, query)
+            
+            headers = {
+                "api-key": self.api_key,
+                "signature": signature,
+                "Content-Type": "application/json"
+            }
+            
+            res = requests.get(
+                f"{self.base_url}/v1/positions/OPEN",
+                headers=headers,
+                params=params,
+                timeout=8
+            )
+            
+            if res.status_code == 200:
+                positions = res.json()
+                for pos in positions:
+                    if pos.get("contractPair") == symbol and float(pos.get("quantity", 0)) > 0:
+                        return {
+                            "qty": float(pos.get("quantity", 0)),
+                            "avg": float(pos.get("entryPrice", 0)),
+                            "liq": float(pos.get("liquidationPrice", 0)),
+                            "leverage": float(pos.get("leverage", 1)),
+                            "unrealized_pnl": float(pos.get("unrealisedPnl", 0)),
+                        }
+                return None  # No position found
+                
+            elif res.status_code == 429:
+                print(f"⚠️ Rate limited on position request for {symbol}")
+                return None
+                
+            else:
+                print(f"⚠️ Failed to fetch position for {symbol}: {res.status_code}")
+                self.api_error_count += 1
+                return None
+                
+        except requests.exceptions.RequestException as e:
+            print(f"⚠️ Position API error for {symbol}: {e}")
+            self.api_error_count += 1
             return None
-    
-    def _fetch_position_with_retry(self, symbol: str, max_retries: int = 2) -> Optional[Dict]:
-        """Fetch position with retry logic."""
-        for attempt in range(max_retries):
-            try:
-                self.api_limiter.wait()
-                timestamp = str(int(time.time() * 1000))
-                
-                # Try to get ALL positions first (more efficient)
-                if attempt == 0:
-                    params = {"timestamp": timestamp, "pageSize": 50}
-                    query = "&".join(f"{k}={v}" for k, v in params.items())
-                    signature = generate_signature(self.secret_key, query)
-                    
-                    headers = {
-                        "api-key": self.api_key,
-                        "signature": signature,
-                        "Content-Type": "application/json"
-                    }
-                    
-                    res = requests.get(
-                        f"{self.base_url}/v1/positions/OPEN",
-                        headers=headers,
-                        params=params,
-                        timeout=8
-                    )
-                    
-                    if res.status_code == 200:
-                        positions = res.json()
-                        for pos in positions:
-                            if pos.get("contractPair") == symbol and float(pos.get("quantity", 0)) > 0:
-                                return {
-                                    "qty": float(pos.get("quantity", 0)),
-                                    "avg": float(pos.get("entryPrice", 0)),
-                                    "liq": float(pos.get("liquidationPrice", 0)),
-                                    "leverage": float(pos.get("leverage", 1)),
-                                    "unrealized_pnl": float(pos.get("unrealisedPnl", 0)),
-                                }
-                        return None  # No position found
-                
-                # Fallback to specific symbol query
-                params = {"symbol": symbol, "timestamp": timestamp, "pageSize": 10}
-                query = "&".join(f"{k}={v}" for k, v in params.items())
-                signature = generate_signature(self.secret_key, query)
-                
-                headers = {
-                    "api-key": self.api_key,
-                    "signature": signature,
-                    "Content-Type": "application/json"
-                }
-                
-                res = requests.get(
-                    f"{self.base_url}/v1/positions/OPEN",
-                    headers=headers,
-                    params=params,
-                    timeout=8
-                )
-                
-                if res.status_code == 200:
-                    positions = res.json()
-                    for pos in positions:
-                        if pos.get("contractPair") == symbol and float(pos.get("quantity", 0)) > 0:
-                            return {
-                                "qty": float(pos.get("quantity", 0)),
-                                "avg": float(pos.get("entryPrice", 0)),
-                                "liq": float(pos.get("liquidationPrice", 0)),
-                                "leverage": float(pos.get("leverage", 1)),
-                                "unrealized_pnl": float(pos.get("unrealisedPnl", 0)),
-                            }
-                    return None  # No position found
-                
-                elif res.status_code == 429:
-                    wait_time = 2 * (attempt + 1)
-                    print(f"⚠️ Rate limited on position request for {symbol}, waiting {wait_time}s...")
-                    time.sleep(wait_time)
-                    continue
-                    
-            except requests.exceptions.RequestException as e:
-                if attempt < max_retries - 1:
-                    wait_time = 1 * (attempt + 1)
-                    print(f"⚠️ Position API error for {symbol} (attempt {attempt + 1}): {e}")
-                    time.sleep(wait_time)
-                else:
-                    print(f"❌ Failed to fetch position for {symbol} after {max_retries} attempts")
-                    self.api_error_count += 1
-                    return None
-        
-        return None
     
     # =========================
     # MARKET DATA
     # =========================
     def fetch_price(self, symbol: str) -> float:
-        """Fetch current price for a symbol with caching."""
-        current_time = time.time()
-        
-        # Check cache first
-        if symbol in self.prices_cache:
-            cached_price, cache_time = self.prices_cache[symbol]
-            if current_time - cache_time < 2:
-                return cached_price
-        
-        # Fetch from API
+        """Fetch current price for a symbol."""
         try:
             self.api_limiter.wait()
             res = requests.post(
@@ -585,8 +482,6 @@ class TradingBot:
             
             if res.status_code == 429:
                 print(f"⚠️ Rate limited on price request for {symbol}")
-                if symbol in self.prices_cache:
-                    return self.prices_cache[symbol][0]
                 raise Exception("Rate limited")
             
             res.raise_for_status()
@@ -596,30 +491,19 @@ class TradingBot:
                 raise ValueError(f"No price data for {symbol}")
             
             price = float(data[-1]["close"])
-            
-            # Update cache
-            self.prices_cache[symbol] = (price, current_time)
             return price
             
         except requests.exceptions.RequestException as e:
             print(f"⚠️ Price fetch error for {symbol}: {e}")
-            if symbol in self.prices_cache:
-                return self.prices_cache[symbol][0]
             raise
     
     # =========================
-    # TRADING STRATEGY - SAFE VERSION
+    # TRADING STRATEGY
     # =========================
     def get_signal(self, symbol: str, price: float, position: Optional[Dict], qty: float) -> str:
         """
-        Safe signal generation.
-        Returns 'hold' if position data is unreliable.
+        Generate trading signal based on position and price.
         """
-        # If position is None but we previously knew about a position, be cautious
-        if position is None and symbol in self.known_positions:
-            print(f"⚠️ {symbol}: Position data unavailable, holding to prevent duplicate buys")
-            return "hold"
-        
         if not position:
             return "buy"
         
@@ -691,7 +575,7 @@ class TradingBot:
         
         timestamp = str(int(time.time() * 1000))
         
-        # Create order payload - try without stop loss first if previous attempts failed
+        # Create order payload
         payload = {
             "timestamp": timestamp,
             "placeType": "ORDER_FORM",
@@ -700,8 +584,6 @@ class TradingBot:
             "symbol": symbol,
             "type": "MARKET",
             "takeProfitPrice": tp_price,
-            # Start without stop loss to avoid precision issues
-            # "stopLossPrice": sl_price,
             "marginAsset": "INR",
             "deviceType": "WEB",
             "reduceOnly": False,
@@ -733,10 +615,6 @@ class TradingBot:
                 data = res.json()
                 print(f"✅ {symbol} BUY ORDER PLACED")
                 print(f"   Order ID: {data.get('orderId', 'N/A')}")
-                
-                # Update known positions
-                self.known_positions[symbol] = self.get_position(symbol, force_refresh=True)
-                
                 return True
             else:
                 error_data = res.json() if res.content else {}
@@ -813,8 +691,7 @@ class TradingBot:
         iteration = 0
         
         print("="*60)
-        print("Starting main loop in MONITORING MODE")
-        print("Trading will be cautious when API is unstable")
+        print("Starting main loop")
         print("="*60 + "\n")
         
         while self.is_running:
@@ -852,7 +729,7 @@ class TradingBot:
                     try:
                         qty = cfg["qty"]
                         
-                        # Get price and position
+                        # Get price and position (always fresh from API)
                         price = self.fetch_price(symbol)
                         position = self.get_position(symbol)
                         
@@ -874,21 +751,13 @@ class TradingBot:
                             f"Next: {self.next_avg_price.get(symbol, 'N/A'):>9}"
                         )
                         
-                        # Add warning if using cached position
-                        if position is None and symbol in self.known_positions:
-                            status_line += " (cached)"
-                        
                         print(status_line)
                         
-                        # Execute trade only if conditions are good
+                        # Execute trade if conditions are good
                         if signal == "buy" and self.check_risk_limits(symbol, qty, price):
-                            # Extra safety check
-                            if self.api_error_count < 5:  # Only trade if API is healthy
-                                print(f"🎯 {symbol}: Executing buy order...")
-                                if self.place_order(symbol, qty, price):
-                                    time.sleep(3)  # Delay after order
-                            else:
-                                print(f"⚠️ {symbol}: Skipping trade due to API issues")
+                            print(f"🎯 {symbol}: Executing buy order...")
+                            if self.place_order(symbol, qty, price):
+                                time.sleep(3)  # Delay after order
                         
                         # Delay between symbols
                         time.sleep(1)
