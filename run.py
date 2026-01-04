@@ -33,7 +33,7 @@ SYMBOL_CONFIG = {
         "qty_precision": 3,
         "min_price": 100,
         "tick_size": 10,
-        "maker_spread": 0.15,
+        "maker_spread": 0.07,
         "target_spread": 0.75,
         "stop_loss_spread": 2.0,
     },
