@@ -4,6 +4,7 @@ import json
 import os
 import time
 import traceback
+import random
 from datetime import datetime, timedelta
 from typing import Dict, Optional, List, Tuple, Any
 import requests
@@ -17,7 +18,7 @@ import sys
 # =========================
 MQTT_BROKER = "45.120.136.157"
 MQTT_PORT = 1883
-MQTT_CLIENT_ID = "pi42_algo_bot"
+MQTT_CLIENT_ID = "pi42_averaging_bot"
 
 HA_PREFIX = "homeassistant"
 DEVICE_ID = "pi42_algo_bot"
@@ -75,9 +76,8 @@ SYMBOL_CONFIG = {
         "avg_percent": 2,
         "target_percent": 1.0,
     },
-
-  
 }
+
 # =========================
 # SIGNATURE
 # =========================
@@ -89,6 +89,73 @@ def generate_signature(secret: str, message: str) -> str:
         hashlib.sha256
     ).hexdigest()
 
+# =========================
+# API ERROR HANDLER
+# =========================
+class APIErrorHandler:
+    """Comprehensive API error handling with retry logic."""
+    
+    def __init__(self, max_retries: int = 3, backoff_factor: float = 1.5):
+        self.max_retries = max_retries
+        self.backoff_factor = backoff_factor
+        self.rate_limit_reset_times = {}
+        
+    def should_retry_error(self, error: Exception, http_status: int = None) -> bool:
+        """Determine if an error should be retried."""
+        # Network errors should be retried
+        if isinstance(error, (requests.exceptions.ConnectionError, 
+                             requests.exceptions.Timeout)):
+            return True
+            
+        # Rate limiting should be retried
+        if http_status == 429:
+            return True
+            
+        # Server errors (5xx) should be retried
+        if http_status and 500 <= http_status < 600:
+            return True
+            
+        # Client errors (4xx) typically shouldn't be retried (except 429)
+        if http_status and 400 <= http_status < 500:
+            return False
+            
+        # Other errors
+        if isinstance(error, requests.exceptions.RequestException):
+            return True
+            
+        return False
+    
+    def get_retry_delay(self, attempt: int, http_status: int = None, retry_after: int = None) -> float:
+        """Calculate retry delay with exponential backoff."""
+        if retry_after:
+            # Use server-specified retry time
+            return float(retry_after)
+        elif http_status == 429:
+            # Rate limiting - use exponential backoff
+            return min(30, self.backoff_factor ** attempt + random.uniform(0, 1))
+        else:
+            # Standard exponential backoff with jitter
+            return min(10, self.backoff_factor ** attempt + random.uniform(0, 0.5))
+    
+    def handle_error(self, operation: str, error: Exception, attempt: int, 
+                    http_status: int = None, retry_after: int = None) -> bool:
+        """Handle API error with retry logic."""
+        if attempt >= self.max_retries:
+            print(f"❌ Max retries exceeded for {operation}")
+            return False
+        
+        if not self.should_retry_error(error, http_status):
+            print(f"❌ Non-retryable error for {operation}: {error}")
+            return False
+        
+        delay = self.get_retry_delay(attempt, http_status, retry_after)
+        
+        error_type = "rate limit" if http_status == 429 else "server error" if http_status and http_status >= 500 else "error"
+        print(f"⚠️ {operation} failed ({error_type}, attempt {attempt + 1}/{self.max_retries}): {error}")
+        print(f"   Retrying in {delay:.1f} seconds...")
+        
+        time.sleep(delay)
+        return True
 
 # =========================
 # API RATE LIMITER
@@ -110,7 +177,6 @@ class RateLimiter:
         
         self.last_call_time = time.time()
 
-
 # =========================
 # AVERAGING BOT BASED ON OPEN TARGET/STOP ORDERS
 # =========================
@@ -129,7 +195,7 @@ class AveragingBot:
         
         # ===== STRATEGY SETTINGS =====
         self.order_timeout = 300  # 5 minutes order timeout
-        self.max_api_errors = 10
+        self.max_api_errors = 50  # Increased threshold
         
         # ===== STATE MANAGEMENT =====
         self.order_history = {}  # Track our order history
@@ -144,12 +210,16 @@ class AveragingBot:
         
         # API error tracking
         self.api_error_count = 0
+        self.consecutive_errors = 0
         
         # Initialize balance attributes
         self.balance = 0.0
         self.pnl_isolated = 0.0
         self.pnl_cross = 0.0
         self.available_balance = 0.0
+        
+        # ===== ERROR HANDLER =====
+        self.error_handler = APIErrorHandler(max_retries=3, backoff_factor=1.5)
         
         # ===== RATE LIMITERS =====
         self.api_limiter = RateLimiter(calls_per_second=1.5)
@@ -184,16 +254,47 @@ class AveragingBot:
         print(f"📊 Trading {len(SYMBOL_CONFIG)} symbols")
         print("="*60 + "\n")
     
+    def _handle_api_call(self, func, operation_name: str, *args, **kwargs):
+        """Wrapper for API calls with error handling."""
+        for attempt in range(self.error_handler.max_retries + 1):
+            try:
+                self.api_limiter.wait()
+                result = func(*args, **kwargs)
+                self.consecutive_errors = 0  # Reset on success
+                return result
+            except requests.exceptions.HTTPError as e:
+                http_status = e.response.status_code if hasattr(e, 'response') else None
+                retry_after = int(e.response.headers.get('Retry-After', 0)) if hasattr(e, 'response') else None
+                
+                if not self.error_handler.handle_error(operation_name, e, attempt, http_status, retry_after):
+                    self.api_error_count += 1
+                    self.consecutive_errors += 1
+                    return None
+            except requests.exceptions.RequestException as e:
+                if not self.error_handler.handle_error(operation_name, e, attempt):
+                    self.api_error_count += 1
+                    self.consecutive_errors += 1
+                    return None
+            except Exception as e:
+                print(f"❌ Unexpected error in {operation_name}: {e}")
+                self.api_error_count += 1
+                self.consecutive_errors += 1
+                return None
+        
+        self.api_error_count += 1
+        self.consecutive_errors += 1
+        return None
+    
     # =========================
     # INITIALIZATION
     # =========================
     def _initialize_balance_and_positions(self):
         """Initialize balance and fetch all positions with retry."""
-        max_retries = 3
-        for attempt in range(max_retries):
+        for attempt in range(5):  # More retries for initialization
             try:
                 print(f"Initializing (attempt {attempt + 1})...")
-                self._update_balance()
+                if not self._update_balance():
+                    raise Exception("Failed to fetch balance")
                 
                 # Initialize order history
                 for symbol in SYMBOL_CONFIG.keys():
@@ -208,23 +309,24 @@ class AveragingBot:
                 
                 # Fetch and analyze existing orders
                 self.update_order_status()
+                print("✅ Initialization complete")
                 return
             except Exception as e:
-                if attempt < max_retries - 1:
+                if attempt < 4:
                     print(f"⚠️ Initialization failed (attempt {attempt + 1}): {e}")
                     time.sleep(3)
                 else:
+                    print(f"❌ Failed to initialize after 5 attempts: {e}")
                     raise
     
     # =========================
     # OPEN ORDERS MANAGEMENT
     # =========================
     def fetch_open_orders(self, symbol: str = None) -> List[Dict]:
-        """Fetch open orders from PI42 API."""
-        try:
-            self.api_limiter.wait()
+        """Fetch open orders from PI42 API with error handling."""
+        
+        def _fetch():
             timestamp = str(int(time.time() * 1000))
-            
             params = {"timestamp": timestamp}
             signature = generate_signature(self.secret_key, f"timestamp={timestamp}")
             
@@ -234,8 +336,9 @@ class AveragingBot:
             }
             
             open_orders_url = f"{self.base_url}/v1/order/open-orders"
-            response = requests.get(open_orders_url, headers=headers, params=params, timeout=10)
-           
+            response = requests.get(open_orders_url, headers=headers, params=params, timeout=15)
+            response.raise_for_status()
+            
             if response.status_code == 200:
                 response_data = response.json()
                 if symbol:
@@ -246,16 +349,16 @@ class AveragingBot:
                     return filtered_orders
                 else:
                     return response_data
-                    
             elif response.status_code == 404:
                 return []
             else:
-                print(f"⚠️ Failed to fetch open orders: {response.status_code} - {response.text}")
-                return []
-                
-        except Exception as e:
-            print(f"⚠️ Error fetching open orders: {str(e)}")
-            return []
+                response.raise_for_status()
+        
+        result = self._handle_api_call(_fetch, "fetch_open_orders")
+        if result is None:
+            print(f"⚠️ Failed to fetch open orders after retries")
+            return []  # Return empty list on complete failure
+        return result
     
     def analyze_open_orders(self, symbol: str, open_orders: List[Dict]) -> Dict:
         """Analyze open orders for averaging strategy."""
@@ -274,16 +377,13 @@ class AveragingBot:
             # Safely handle price (could be None for market orders)
             price_str = order.get("price")
             price = float(price_str) if price_str is not None else 0.0
-           
             
             # Safely handle stop price (could be None for limit orders)
             stop_price_str = order.get("stopPrice")
             stop_price = float(stop_price_str) if stop_price_str is not None else 0.0
             
-            
             if side == "BUY":
                 if order_type == "LIMIT":
-                    # Safely handle order amount
                     order_amount_str = order.get("orderAmount", "0")
                     filled_amount_str = order.get("filledAmount", "0")
                     
@@ -297,7 +397,6 @@ class AveragingBot:
                     })
             elif side == "SELL":
                 if stop_price > 0:
-                    # Safely handle order amount
                     order_amount_str = order.get("orderAmount", "0")
                     
                     order_data = {
@@ -308,10 +407,8 @@ class AveragingBot:
                         "order_type": order_type,
                     }
                     print(f"   Detected SELL order: {order_data}")
-                    # Check if it's likely a TP (no SL check)
-                    if "STOP_LIMIT" in order_type:
+                    if "STOP_LIMIT" in order_type or "LIMIT" in order_type:
                         take_profit_orders.append(order_data)
-        
         
         return {
             "buy_limits": buy_limit_orders,
@@ -325,14 +422,12 @@ class AveragingBot:
             return None
         
         try:
-            # Filter out any orders with invalid trigger prices
             valid_orders = [order for order in take_profit_orders 
                            if order.get("trigger_price") and order["trigger_price"] > 0]
             
             if not valid_orders:
                 return None
             
-            # Get the minimum trigger price
             lowest_tp = min(valid_orders, key=lambda x: x["trigger_price"])
             return lowest_tp["trigger_price"]
         except Exception as e:
@@ -342,37 +437,27 @@ class AveragingBot:
     def should_place_averaging_order(self, symbol: str, ltp: float, 
                                      lowest_tp_price: Optional[float],
                                      has_position: bool) -> Tuple[bool, float, bool]:
-        """Determine if we should place an averaging order.
-        Returns: (should_place, target_price, is_create_tp_only)
-        """
+        """Determine if we should place an averaging order."""
         cfg = SYMBOL_CONFIG[symbol]
         avg_percent = cfg["avg_percent"]
         
-        # If we have a position but no TP orders, we need to create TP only
         if has_position and lowest_tp_price is None:
             print(f"⚠️ {symbol}: Has position but no TP orders. Creating TP only...")
             return False, ltp, True
         
-        # If no TP orders exist and no position, place market order immediately
         if lowest_tp_price is None:
             print(f"💰 {symbol}: No position or TP orders, placing market order")
             return True, ltp, False
         
-        # Calculate price avg_percent% below lowest TP
         target_price = lowest_tp_price * (1 - avg_percent / 100)
-        
-        # Also check if price has dropped significantly from the TP
         current_drop = ((lowest_tp_price - ltp) / lowest_tp_price) * 100
-        print(current_drop, avg_percent)
         
         if current_drop > avg_percent:
             print(f"📉 {symbol}: LTP dropped {current_drop:.2f}% from TP {lowest_tp_price:.2f}")
             return True, target_price, False
         
-        # Calculate how much more drop is needed
         needed_drop = avg_percent - current_drop
         print(f"🎯 {symbol}: Close to target ({needed_drop:.2f}% more needed)")
-        
         
         return False, target_price, False
     
@@ -405,66 +490,66 @@ class AveragingBot:
         """Place a MARKET order with take profit only (no stop loss)."""
         self.order_limiter.wait()
         
-        cfg = SYMBOL_CONFIG.get(symbol, {})
-        qty_precision = cfg.get("qty_precision", 3)
-        formatted_qty = round(qty, qty_precision)
-        timestamp = str(int(time.time() * 1000))
-        
-        payload = {
-            "timestamp": timestamp,
-            "placeType": "ORDER_FORM",
-            "quantity": formatted_qty,
-            "side": "BUY",
-            "symbol": symbol,
-            "type": "MARKET",
-            "marginAsset": "INR",
-            "deviceType": "WEB",
-            "timeInForce": "GTC",
-            "reduceOnly": False,
-        }
-        
-        print(f"\n📤 Placing MARKET order for {symbol}:")
-        print(f"   Type: MARKET BUY")
-        print(f"   Qty: {formatted_qty}")
-        print(f"   Market order - no price specified")
-        
-        signature = generate_signature(
-            self.secret_key, json.dumps(payload, separators=(",", ":"))
-        )
-        
-        headers = {
-            "api-key": self.api_key,
-            "signature": signature,
-            "Content-Type": "application/json"
-        }
-        
-        try:
+        def _place_order():
+            cfg = SYMBOL_CONFIG.get(symbol, {})
+            qty_precision = cfg.get("qty_precision", 3)
+            formatted_qty = round(qty, qty_precision)
+            timestamp = str(int(time.time() * 1000))
+            
+            payload = {
+                "timestamp": timestamp,
+                "placeType": "ORDER_FORM",
+                "quantity": formatted_qty,
+                "side": "BUY",
+                "symbol": symbol,
+                "type": "MARKET",
+                "marginAsset": "INR",
+                "deviceType": "WEB",
+                "timeInForce": "GTC",
+                "reduceOnly": False,
+            }
+            
+            print(f"\n📤 Placing MARKET order for {symbol}:")
+            print(f"   Type: MARKET BUY")
+            print(f"   Qty: {formatted_qty}")
+            
+            signature = generate_signature(
+                self.secret_key, json.dumps(payload, separators=(",", ":"))
+            )
+            
+            headers = {
+                "api-key": self.api_key,
+                "signature": signature,
+                "Content-Type": "application/json"
+            }
+            
             res = requests.post(
                 f"{self.base_url}/v1/order/place-order",
                 json=payload,
                 headers=headers,
-                timeout=10
+                timeout=15
             )
-          
+            res.raise_for_status()
+            return res
+        
+        try:
+            res = self._handle_api_call(_place_order, "place_market_order")
+            if res is None:
+                print(f"❌ Failed to place market order for {symbol} after retries")
+                return None
+            
             if res.status_code == 201:
                 data = res.json()
                 order_id = data.get("orderId") or data.get("clientOrderId")
-                print(f"   Order ID: {order_id}")
-                # Try to get the filled price from the response
-                filled_price = 0
-                if "price" in data and data["price"]:
-                    filled_price = float(data.get("price", 0))
-                print(f"   Filled Price: {filled_price}")
+                filled_price = float(data.get("price", 0)) if data.get("price") else 0
+                
                 print(f"✅ {symbol} MARKET ORDER PLACED")
                 print(f"   Order ID: {order_id}")
+                print(f"   Filled at: {filled_price:.2f}")
                 
                 if filled_price > 0:
-                    print(f"   Filled at: {filled_price:.2f}")
-                    
-                    # Place TP order only (no stop loss)
-                    self.place_take_profit_order(symbol, formatted_qty, filled_price)
+                    self.place_take_profit_order_with_retry(symbol, formatted_qty, filled_price)
                 
-                # Track order in history
                 order_info = {
                     "order_id": order_id,
                     "symbol": symbol,
@@ -473,6 +558,7 @@ class AveragingBot:
                     "timestamp": timestamp,
                     "status": "FILLED" if filled_price > 0 else "OPEN",
                     "filled_price": filled_price,
+                    "reduceOnly": True,
                 }
                 
                 self.order_history[symbol]["filled_orders"].append(order_info)
@@ -485,21 +571,21 @@ class AveragingBot:
                 print(f"   Error: {error_data}")
                 return None
                 
-        except requests.exceptions.RequestException as e:
+        except Exception as e:
             print(f"❌ {symbol} Order error: {e}")
             return None
     
-    def place_take_profit_order(self, symbol: str, qty: float, entry_price: float) -> bool:
-        """Place a take profit order (no stop loss)."""
-        try:
+    def place_take_profit_order_with_retry(self, symbol: str, qty: float, entry_price: float) -> bool:
+        """Place a take profit order with retry logic."""
+        
+        def _place_tp():
             cfg = SYMBOL_CONFIG.get(symbol, {})
             target_percent = cfg.get("target_percent", 1.0) / 100
             tp_price = entry_price * (1 + target_percent)
             tp_price_int = self.format_price(tp_price, symbol)
             
-            # Ensure minimum price
             if tp_price_int <= 0:
-                tp_price_int = max(1, int(entry_price * 1.01))  # At least 1% above
+                tp_price_int = max(1, int(entry_price * 1.01))
             
             timestamp = str(int(time.time() * 1000))
             
@@ -534,8 +620,16 @@ class AveragingBot:
                 f"{self.base_url}/v1/order/place-order",
                 json=payload,
                 headers=headers,
-                timeout=10
+                timeout=15
             )
+            res.raise_for_status()
+            return res
+        
+        try:
+            res = self._handle_api_call(_place_tp, "place_tp_order")
+            if res is None:
+                print(f"❌ Failed to place TP order for {symbol} after retries")
+                return False
             
             if res.status_code == 201:
                 print(f"   ✅ TP order placed")
@@ -559,7 +653,7 @@ class AveragingBot:
         print(f"\n🎯 Creating TP for existing {symbol} position:")
         print(f"   Position: {position_qty:.4f} @ {entry_price:.2f}")
         
-        success = self.place_take_profit_order(symbol, position_qty, entry_price)
+        success = self.place_take_profit_order_with_retry(symbol, position_qty, entry_price)
         
         if success:
             print(f"✅ Successfully created TP order for {symbol}")
@@ -572,11 +666,10 @@ class AveragingBot:
     # POSITION MANAGEMENT
     # =========================
     def get_position(self, symbol: str) -> Optional[Dict]:
-        """Fetch position from API."""
-        try:
-            self.api_limiter.wait()
+        """Fetch position from API with error handling."""
+        
+        def _fetch_position():
             timestamp = str(int(time.time() * 1000))
-            
             params = {"symbol": symbol, "timestamp": timestamp, "pageSize": 10}
             query = "&".join(f"{k}={v}" for k, v in params.items())
             signature = generate_signature(self.secret_key, query)
@@ -591,8 +684,16 @@ class AveragingBot:
                 f"{self.base_url}/v1/positions/OPEN",
                 headers=headers,
                 params=params,
-                timeout=8
+                timeout=15
             )
+            res.raise_for_status()
+            return res
+        
+        try:
+            res = self._handle_api_call(_fetch_position, "get_position")
+            if res is None:
+                print(f"⚠️ Failed to fetch position for {symbol} after retries")
+                return None
             
             if res.status_code == 200:
                 positions = res.json()
@@ -604,59 +705,58 @@ class AveragingBot:
                             "unrealized_pnl": float(pos.get("unrealisedPnl", 0)),
                         }
                 return None
-                
-            elif res.status_code == 429:
-                print(f"⚠️ Rate limited on position request for {symbol}")
-                return None
-                
             else:
                 print(f"⚠️ Failed to fetch position for {symbol}: {res.status_code}")
-                self.api_error_count += 1
                 return None
                 
-        except requests.exceptions.RequestException as e:
+        except Exception as e:
             print(f"⚠️ Position API error for {symbol}: {e}")
-            self.api_error_count += 1
             return None
     
     # =========================
     # MARKET DATA
     # =========================
     def fetch_ltp(self, symbol: str) -> float:
-        """Fetch Last Traded Price."""
-        try:
-            self.api_limiter.wait()
+        """Fetch Last Traded Price with error handling."""
+        
+        def _fetch_ltp():
             res = requests.post(
                 f"{self.market_url}/v1/market/klines",
                 json={"pair": symbol, "interval": "1m", "limit": 1},
-                timeout=5
+                timeout=10
             )
-            
-            if res.status_code == 429:
-                print(f"⚠️ Rate limited on LTP request for {symbol}")
-                raise Exception("Rate limited")
-            
             res.raise_for_status()
-            data = res.json()
+            return res
+        
+        try:
+            res = self._handle_api_call(_fetch_ltp, "fetch_ltp")
+            if res is None:
+                raise Exception(f"Failed to fetch LTP for {symbol} after retries")
             
+            data = res.json()
             if not data:
                 raise ValueError(f"No LTP data for {symbol}")
             
             ltp = float(data[-1]["close"])
             return ltp
             
-        except requests.exceptions.RequestException as e:
+        except Exception as e:
             print(f"⚠️ LTP fetch error for {symbol}: {e}")
             raise
     
     # =========================
     # BALANCE MANAGEMENT
     # =========================
-    def _update_balance(self):
+    def _update_balance(self) -> bool:
         """Fetch and update balance information."""
         try:
-            self.api_limiter.wait()
-            bal = self.get_user_balance()
+            bal = self.get_user_balance_with_retry()
+            if bal is None:
+                print("⚠️ Failed to update balance, using cached values")
+                if hasattr(self, 'balance'):
+                    return False
+                else:
+                    raise Exception("No cached balance available")
             
             self.balance = bal["inr_balance"]
             self.pnl_isolated = bal["pnl_isolated"]
@@ -664,54 +764,54 @@ class AveragingBot:
             self.total_pnl = self.pnl_isolated + self.pnl_cross
             self.available_balance = max(0, self.balance - abs(self.pnl_isolated))
             self.last_update_time = datetime.now()
+            return True
             
         except Exception as e:
             print(f"⚠️ Failed to update balance: {e}")
-            # Use cached values if available
             if hasattr(self, 'balance'):
                 print(f"   Using cached balance: {self.balance:.2f} INR")
+                return False
             else:
                 raise
     
-    def get_user_balance(self) -> Dict:
-        """Fetch user balance from PI42 API."""
-        timestamp = str(int(time.time() * 1000))
-        query = f"marginAsset=INR&timestamp={timestamp}"
-        signature = generate_signature(self.secret_key, query)
+    def get_user_balance_with_retry(self) -> Optional[Dict]:
+        """Fetch user balance with retry logic."""
         
-        headers = {
-            "api-key": self.api_key,
-            "signature": signature,
-            "Content-Type": "application/json"
-        }
-        
-        try:
+        def _fetch_balance():
+            timestamp = str(int(time.time() * 1000))
+            query = f"marginAsset=INR&timestamp={timestamp}"
+            signature = generate_signature(self.secret_key, query)
+            
+            headers = {
+                "api-key": self.api_key,
+                "signature": signature,
+                "Content-Type": "application/json"
+            }
+            
             res = requests.get(
                 f"{self.base_url}/v1/wallet/futures-wallet/details",
                 headers=headers,
                 params={"marginAsset": "INR", "timestamp": timestamp},
-                timeout=10
+                timeout=15
             )
-            
-            if res.status_code == 429:
-                print("⚠️ Rate limited on balance request, waiting...")
-                time.sleep(5)
-                return {"inr_balance": self.balance, "pnl_isolated": self.pnl_isolated, "pnl_cross": self.pnl_cross}
-            
             res.raise_for_status()
-            data = res.json()
+            return res
+        
+        try:
+            res = self._handle_api_call(_fetch_balance, "get_balance")
+            if res is None:
+                return None
             
+            data = res.json()
             return {
                 "inr_balance": float(data.get("inrBalance", 0)),
                 "pnl_isolated": float(data.get("unrealisedPnlIsolated", 0)),
                 "pnl_cross": float(data.get("unrealisedPnlCross", 0)),
             }
             
-        except requests.exceptions.RequestException as e:
+        except Exception as e:
             print(f"⚠️ Balance API error: {e}")
-            if hasattr(self, 'balance'):
-                return {"inr_balance": self.balance, "pnl_isolated": self.pnl_isolated, "pnl_cross": self.pnl_cross}
-            raise
+            return None
     
     # =========================
     # MQTT HANDLERS
@@ -809,6 +909,8 @@ class AveragingBot:
             "cancelled_orders": total_cancelled_orders,
             "timestamp": int(time.time()),
             "last_update": self.last_update_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "api_errors": self.api_error_count,
+            "consecutive_errors": self.consecutive_errors,
         }
         
         try:
@@ -821,8 +923,6 @@ class AveragingBot:
         except Exception as e:
             print(f"⚠️ MQTT publish failed: {e}")
     
-   
-    
     # =========================
     # ORDER TRACKING
     # =========================
@@ -831,19 +931,19 @@ class AveragingBot:
         for symbol in SYMBOL_CONFIG.keys():
             try:
                 open_orders = self.fetch_open_orders(symbol)
+                if open_orders is None:
+                    print(f"⚠️ Skipping order status update for {symbol} due to API error")
+                    continue
+                    
                 api_order_ids = set()
-                
-                # Track orders from API
                 for order in open_orders:
                     order_id = order.get("clientOrderId") or order.get("linkId")
-                    api_order_ids.add(order_id)
+                    if order_id:
+                        api_order_ids.add(order_id)
                 
-                # Check our tracked orders
                 for order in list(self.order_history[symbol]["open_orders"]):
                     order_id = order["order_id"]
-                    
                     if order_id not in api_order_ids:
-                        # Order no longer in API, assume filled or cancelled
                         print(f"✅ {symbol}: Order {order_id} not found in API, marking as filled")
                         order["status"] = "FILLED"
                         self.order_history[symbol]["filled_orders"].append(order)
@@ -853,7 +953,6 @@ class AveragingBot:
             except Exception as e:
                 print(f"⚠️ Error updating order status for {symbol}: {e}")
     
-   
     # =========================
     # MAIN LOOP
     # =========================
@@ -872,25 +971,30 @@ class AveragingBot:
                 iteration += 1
                 current_time = datetime.now()
                 
+                # Check for excessive errors
+                if self.consecutive_errors > 20:
+                    print(f"⚠️ Too many consecutive errors ({self.consecutive_errors}), waiting 30 seconds...")
+                    time.sleep(30)
+                    self.consecutive_errors = 0
+                    continue
                 
                 print(f"🔄 Iteration {iteration} - {current_time.strftime('%Y-%m-%d %H:%M:%S')}")
                 
                 # Update order status
                 self.update_order_status()
                 time.sleep(1)
-                try:
-                    self._update_balance()
-                    self.publish_mqtt_status()
-                    
-                    print(f"💰 Balance: {self.balance:.2f} INR | "
-                          f"Available: {self.available_balance:.2f} INR | "
-                          f"Total PnL: {self.total_pnl:+.2f} INR")
-                    print(f"📊 API Errors: {self.api_error_count}/{self.max_api_errors}")
-                    
-                except Exception as e:
-                    print(f"⚠️ Balance update failed: {e}")
-                    time.sleep(5)
-                    continue
+                
+                # Update balance and publish status
+                if not self._update_balance():
+                    print("⚠️ Using cached balance due to update failure")
+                
+                self.publish_mqtt_status()
+                
+                print(f"💰 Balance: {self.balance:.2f} INR | "
+                      f"Available: {self.available_balance:.2f} INR | "
+                      f"Total PnL: {self.total_pnl:+.2f} INR")
+                print(f"📊 API Errors: {self.api_error_count} | "
+                      f"Consecutive Errors: {self.consecutive_errors}")
                 
                 # Process each symbol
                 for symbol, cfg in SYMBOL_CONFIG.items():
@@ -900,7 +1004,7 @@ class AveragingBot:
                         # Fetch market data
                         try:
                             ltp = self.fetch_ltp(symbol)
-                            time.sleep(1)
+                            time.sleep(0.5)
                         except Exception as e:
                             print(f"⚠️ Failed to fetch LTP for {symbol}: {e}")
                             continue
@@ -908,23 +1012,19 @@ class AveragingBot:
                         # Fetch position
                         position = self.get_position(symbol)
                         has_position = position is not None and position["quantity"] > 0
-                        time.sleep(1)
+                        time.sleep(0.5)
+                        
                         # Fetch and analyze open orders
                         open_orders = self.fetch_open_orders(symbol)
-                        
-                        # Skip if API error fetching orders
                         if open_orders is None:
                             print(f"⚠️ Skipping {symbol} due to API error fetching orders")
                             continue
                         
                         order_analysis = self.analyze_open_orders(symbol, open_orders)
-                        print("Take Profits: "+str(order_analysis["take_profits"]))
-                        # Get lowest take profit price
                         lowest_tp_price = self.get_lowest_take_profit_price(
                             order_analysis["take_profits"]
                         )
                         
-                        # Check if we should place market order or create TP
                         should_place, target_price, create_tp_only = self.should_place_averaging_order(
                             symbol, ltp, lowest_tp_price, has_position
                         )
@@ -958,7 +1058,6 @@ class AveragingBot:
                         
                         # Handle different scenarios
                         if create_tp_only:
-                            # We have a position but no TP orders
                             print(f"\n🎯 Creating TP for existing {symbol} position...")
                             success = self.create_tp_for_existing_position(
                                 symbol, position_qty, position_avg
@@ -969,15 +1068,13 @@ class AveragingBot:
                                 print(f"❌ Failed to create TP for {symbol}")
                         
                         elif should_place:
-                            # Place market order with TP only
                             print(f"\n🎯 {symbol}: Placing MARKET order with TP only")
                             order_id = self.place_market_order_with_tp(symbol, qty, ltp)
                             if order_id:
                                 print(f"✅ Market order placed successfully!")
-                                time.sleep(2)  # Rate limiting
+                                time.sleep(2)
                         
                         else:
-                            # No action needed
                             if lowest_tp_price and has_position:
                                 current_drop = ((lowest_tp_price - ltp) / lowest_tp_price) * 100
                                 needed_drop = cfg["avg_percent"] - current_drop
@@ -988,14 +1085,14 @@ class AveragingBot:
                             else:
                                 print(f"⏳ {symbol}: No position, waiting for conditions...")
                         
-                        time.sleep(1)
+                        time.sleep(0.5)
                         
                     except Exception as e:
                         print(f"❌ Error processing {symbol}: {e}")
                         traceback.print_exc()
                         continue
                 
-                wait_time = 2
+                wait_time = 3
                 print(f"\n⏳ Waiting {wait_time} seconds until next update...")
                 for i in range(wait_time):
                     if not self.is_running:
@@ -1009,9 +1106,8 @@ class AveragingBot:
                 
             except Exception as e:
                 print(f"\n❌ Critical error in iteration {iteration}: {e}")
-                print(traceback.format_exc())
+                traceback.print_exc()
                 time.sleep(30)
-
 
 # =========================
 # START
@@ -1022,5 +1118,5 @@ if __name__ == "__main__":
         bot.run()
     except Exception as e:
         print(f"❌ Failed to start bot: {e}")
-        print(traceback.format_exc())
+        traceback.print_exc()
         sys.exit(1)
