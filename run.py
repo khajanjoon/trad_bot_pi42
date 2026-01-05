@@ -541,6 +541,7 @@ class AveragingBot:
             if res.status_code == 201:
                 data = res.json()
                 order_id = data.get("orderId") or data.get("clientOrderId")
+                timestamp = str(int(time.time() * 1000))
                 filled_price = float(data.get("price", 0)) if data.get("price") else 0
                 cfg = SYMBOL_CONFIG.get(symbol, {})
                 qty_precision = cfg.get("qty_precision", 3)
@@ -583,6 +584,7 @@ class AveragingBot:
         
         def _place_tp():
             cfg = SYMBOL_CONFIG.get(symbol, {})
+            timestamp = str(int(time.time() * 1000))
             target_percent = cfg.get("target_percent", 1.0) / 100
             tp_price = entry_price * (1 + target_percent)
             tp_price_int = self.format_price(tp_price, symbol)
