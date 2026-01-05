@@ -542,6 +542,7 @@ class AveragingBot:
                 data = res.json()
                 order_id = data.get("orderId") or data.get("clientOrderId")
                 filled_price = float(data.get("price", 0)) if data.get("price") else 0
+                cfg = SYMBOL_CONFIG.get(symbol, {})
                 qty_precision = cfg.get("qty_precision", 3)
                 formatted_qty = round(qty, qty_precision)
                 
