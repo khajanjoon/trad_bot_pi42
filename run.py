@@ -49,7 +49,7 @@ SYMBOL_CONFIG = {
         "target_percent": 1.0,
     },
     "BNBINR": {
-        "qty": 0.01,
+        "qty": 0.07,
         "price_precision": 0,
         "qty_precision": 2,
         "avg_percent": 2,
