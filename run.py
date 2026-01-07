@@ -767,7 +767,7 @@ class AveragingBot:
             self.pnl_isolated = bal["pnl_isolated"]
             self.pnl_cross = bal["pnl_cross"]
             self.total_pnl = self.pnl_isolated + self.pnl_cross
-            self.available_balance = max(0, self.balance - abs(self.pnl_isolated))
+            self.available_balance = max(0, self.balance + (self.pnl_isolated))
             self.last_update_time = datetime.now()
             return True
             
