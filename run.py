@@ -29,49 +29,49 @@ ERROR_TOPIC = "pi42/algo_bot/errors"
 SYMBOL_CONFIG = {
     "LTCINR": {
         "qty": 0.5,
-        "price_precision": 0,
+        "price_precision": 0,  # 0 decimal places
         "qty_precision": 3,
         "avg_percent": 2,
         "target_percent": 1.0,
     },
     "SOLINR": {
         "qty": 0.5,
-        "price_precision": 0,
+        "price_precision": 0,  # 0 decimal places
         "qty_precision": 3,
         "avg_percent": 2,
         "target_percent": 1.0,
     },
     "BTCINR": {
         "qty": 0.002,
-        "price_precision": 0,
+        "price_precision": 0,  # 0 decimal places
         "qty_precision": 3,
         "avg_percent": 2,
         "target_percent": 1.0,
     },
     "BNBINR": {
         "qty": 0.07,
-        "price_precision": 0,
+        "price_precision": 0,  # 0 decimal places
         "qty_precision": 2,
         "avg_percent": 2,
         "target_percent": 1.0,
     },
     "ETHINR": {
         "qty": 0.02,
-        "price_precision": 0,
+        "price_precision": 0,  # 0 decimal places
         "qty_precision": 3,
         "avg_percent": 2,
         "target_percent": 1.0,
     },
     "BCHINR": {
         "qty": 0.09,
-        "price_precision": 0,
+        "price_precision": 0,  # 0 decimal places
         "qty_precision": 3,
         "avg_percent": 2,
         "target_percent": 1.0,
     },
     "XRPINR": {
         "qty": 20,
-        "price_precision": 2,
+        "price_precision": 2,  # 2 decimal places
         "qty_precision": 3,
         "avg_percent": 2,
         "target_percent": 1.0,
@@ -462,29 +462,31 @@ class AveragingBot:
         return False, target_price, False
     
     # =========================
-    # ORDER MANAGEMENT
+    # ORDER MANAGEMENT - MODIFIED FOR PRICE PRECISION
     # =========================
-    def format_price(self, price: float, symbol: str) -> int:
-        """Format price as integer."""
+    def format_price(self, price: float, symbol: str) -> float:
+        """Format price according to symbol's price precision."""
         cfg = SYMBOL_CONFIG.get(symbol, {})
-        min_price = cfg.get("min_price", 1)
+        price_precision = cfg.get("price_precision", 0)
         
-        if min_price > 1:
-            rounded = round(price / min_price) * min_price
-        else:
-            rounded = round(price)
+        # Round to the specified decimal places
+        formatted_price = round(price, price_precision)
         
-        return int(rounded)
+        # For integer prices (precision 0), convert to int
+        if price_precision == 0:
+            formatted_price = int(formatted_price)
+        
+        return formatted_price
     
-    def calculate_take_profit_price(self, symbol: str, entry_price: float) -> int:
-        """Calculate take profit price."""
+    def calculate_take_profit_price(self, symbol: str, entry_price: float) -> float:
+        """Calculate take profit price with proper formatting."""
         cfg = SYMBOL_CONFIG.get(symbol, {})
         target_percent = cfg.get("target_percent", 1.0) / 100
         
         tp_price = entry_price * (1 + target_percent)
-        tp_price_int = self.format_price(tp_price, symbol)
+        tp_price_formatted = self.format_price(tp_price, symbol)
         
-        return tp_price_int
+        return tp_price_formatted
     
     def place_market_order_with_tp(self, symbol: str, qty: float, price: float) -> Optional[str]:
         """Place a MARKET order with take profit only (no stop loss)."""
@@ -512,6 +514,8 @@ class AveragingBot:
             print(f"\n📤 Placing MARKET order for {symbol}:")
             print(f"   Type: MARKET BUY")
             print(f"   Qty: {formatted_qty}")
+            print(f"   Qty Precision: {qty_precision}")
+            print(f"   Price Precision: {cfg.get('price_precision', 0)}")
             
             signature = generate_signature(
                 self.secret_key, json.dumps(payload, separators=(",", ":"))
@@ -549,7 +553,7 @@ class AveragingBot:
                 
                 print(f"✅ {symbol} MARKET ORDER PLACED")
                 print(f"   Order ID: {order_id}")
-                print(f"   Filled at: {filled_price:.2f}")
+                print(f"   Filled at: {filled_price:.{cfg.get('price_precision', 0)}f}")
                 
                 if filled_price > 0:
                     self.place_take_profit_order_with_retry(symbol, formatted_qty, filled_price)
@@ -580,19 +584,24 @@ class AveragingBot:
             return None
     
     def place_take_profit_order_with_retry(self, symbol: str, qty: float, entry_price: float) -> bool:
-        """Place a take profit order with retry logic."""
+        """Place a take profit order with retry logic and proper price formatting."""
         
         def _place_tp():
             cfg = SYMBOL_CONFIG.get(symbol, {})
             timestamp = str(int(time.time() * 1000))
+            price_precision = cfg.get("price_precision", 0)
+            
+            # Calculate and format TP price
             target_percent = cfg.get("target_percent", 1.0) / 100
             tp_price = entry_price * (1 + target_percent)
-            tp_price_int = self.format_price(tp_price, symbol)
+            tp_price_formatted = self.format_price(tp_price, symbol)
             
-            if tp_price_int <= 0:
-                tp_price_int = max(1, int(entry_price * 1.01))
+            if tp_price_formatted <= 0:
+                tp_price_formatted = max(1, self.format_price(entry_price * 1.01, symbol))
             
-            timestamp = str(int(time.time() * 1000))
+            print(f"   Placing TP @ {tp_price_formatted:.{price_precision}f}")
+            print(f"   Entry price: {entry_price:.{price_precision}f}")
+            print(f"   Price precision: {price_precision}")
             
             payload = {
                 "timestamp": timestamp,
@@ -601,15 +610,13 @@ class AveragingBot:
                 "side": "SELL",
                 "symbol": symbol,
                 "type": "STOP_LIMIT",
-                "stopPrice": tp_price_int,
-                "price": tp_price_int,
+                "stopPrice": tp_price_formatted,
+                "price": tp_price_formatted,
                 "marginAsset": "INR",
                 "deviceType": "WEB",
                 "timeInForce": "GTC",
                 "reduceOnly": True,
             }
-            
-            print(f"   Placing TP @ {tp_price_int}")
             
             signature = generate_signature(
                 self.secret_key, json.dumps(payload, separators=(",", ":"))
@@ -655,8 +662,12 @@ class AveragingBot:
     
     def create_tp_for_existing_position(self, symbol: str, position_qty: float, entry_price: float) -> bool:
         """Create TP order only for an existing position."""
+        cfg = SYMBOL_CONFIG.get(symbol, {})
+        price_precision = cfg.get("price_precision", 0)
+        
         print(f"\n🎯 Creating TP for existing {symbol} position:")
-        print(f"   Position: {position_qty:.4f} @ {entry_price:.2f}")
+        print(f"   Position: {position_qty:.{cfg.get('qty_precision', 3)}f} @ {entry_price:.{price_precision}f}")
+        print(f"   Price precision: {price_precision}")
         
         success = self.place_take_profit_order_with_retry(symbol, position_qty, entry_price)
         
@@ -1005,6 +1016,7 @@ class AveragingBot:
                 for symbol, cfg in SYMBOL_CONFIG.items():
                     try:
                         qty = cfg["qty"]
+                        price_precision = cfg.get("price_precision", 0)
                         
                         # Fetch market data
                         try:
@@ -1034,19 +1046,25 @@ class AveragingBot:
                             symbol, ltp, lowest_tp_price, has_position
                         )
                         
-                        # Display status
+                        # Display status with proper precision
                         position_qty = position["quantity"] if position else 0
                         position_avg = position["entry_price"] if position else 0
                         
                         status_line = (
                             f"\n📊 {symbol} Status:\n"
-                            f"   LTP: {ltp:.2f}\n"
-                            f"   Position: {position_qty:.3f} @ {position_avg:.2f}\n"
+                            f"   LTP: {ltp:.{price_precision}f}\n"
+                            f"   Price Precision: {price_precision}\n"
+                            f"   Qty Precision: {cfg.get('qty_precision', 3)}\n"
                         )
+                        
+                        if position_qty > 0:
+                            status_line += f"   Position: {position_qty:.{cfg.get('qty_precision', 3)}f} @ {position_avg:.{price_precision}f}\n"
+                        else:
+                            status_line += f"   Position: None\n"
                         
                         if lowest_tp_price:
                             current_drop = ((lowest_tp_price - ltp) / lowest_tp_price) * 100
-                            status_line += f"   Lowest TP: {lowest_tp_price:.2f}\n"
+                            status_line += f"   Lowest TP: {lowest_tp_price:.{price_precision}f}\n"
                             status_line += f"   Current drop from TP: {current_drop:.2f}%\n"
                             status_line += f"   Target drop needed: {cfg['avg_percent']}%\n"
                         else:
