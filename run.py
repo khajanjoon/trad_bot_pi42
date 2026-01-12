@@ -69,9 +69,9 @@ SYMBOL_CONFIG = {
         "avg_percent": 2,
         "target_percent": 1.0,
     },
-    "XMRINR": {
-        "qty": 0.125,
-        "price_precision": 0,
+    "XRPINR": {
+        "qty": 20,
+        "price_precision": 2,
         "qty_precision": 3,
         "avg_percent": 2,
         "target_percent": 1.0,
