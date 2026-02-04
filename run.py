@@ -5,1141 +5,204 @@ import os
 import time
 import traceback
 import random
-from datetime import datetime, timedelta
-from typing import Dict, Optional, List, Tuple, Any
+from datetime import datetime
+from typing import Dict, Optional, List, Tuple
 import requests
 from dotenv import load_dotenv
-import paho.mqtt.client as mqtt
 import signal
 import sys
 
 # =========================
-# CONFIGURATION
+# SYMBOL CONFIG
 # =========================
-MQTT_BROKER = "45.120.136.157"
-MQTT_PORT = 1883
-MQTT_CLIENT_ID = "pi42_averaging_bot"
-
-HA_PREFIX = "homeassistant"
-DEVICE_ID = "pi42_algo_bot"
-STATE_TOPIC = "pi42/algo_bot/state"
-ERROR_TOPIC = "pi42/algo_bot/errors"
-
-# Symbol configuration
 SYMBOL_CONFIG = {
-    "LTCINR": {
-        "qty": 0.5,
-        "price_precision": 0,  # 0 decimal places
-        "qty_precision": 3,
-        "avg_percent": 2,
-        "target_percent": 1.0,
-    },
-    "SOLINR": {
-        "qty": 0.5,
-        "price_precision": 0,  # 0 decimal places
-        "qty_precision": 3,
-        "avg_percent": 2,
-        "target_percent": 1.0,
-    },
-    "BTCINR": {
-        "qty": 0.002,
-        "price_precision": 0,  # 0 decimal places
-        "qty_precision": 3,
-        "avg_percent": 2,
-        "target_percent": 1.0,
-    },
-    "BNBINR": {
-        "qty": 0.07,
-        "price_precision": 0,  # 0 decimal places
-        "qty_precision": 2,
-        "avg_percent": 2,
-        "target_percent": 1.0,
-    },
-    "ETHINR": {
-        "qty": 0.02,
-        "price_precision": 0,  # 0 decimal places
-        "qty_precision": 3,
-        "avg_percent": 2,
-        "target_percent": 1.0,
-    },
-    "BCHINR": {
-        "qty": 0.09,
-        "price_precision": 0,  # 0 decimal places
-        "qty_precision": 3,
-        "avg_percent": 2,
-        "target_percent": 1.0,
-    },
-    "XRPINR": {
-        "qty": 20,
-        "price_precision": 2,  # 2 decimal places
-        "qty_precision": 3,
-        "avg_percent": 2,
-        "target_percent": 1.0,
-    },
-}
+    "XAGINR": {"qty": 1, "price_precision": 0, "qty_precision": 3, "avg_percent": 2, "target_percent": 1.0},
+    "XAUINR": {"qty": 0.005, "price_precision": 0, "qty_precision": 3, "avg_percent": 2, "target_percent": 1.0},
+                 }
 
 # =========================
 # SIGNATURE
 # =========================
 def generate_signature(secret: str, message: str) -> str:
-    """Generate HMAC SHA256 signature."""
-    return hmac.new(
-        secret.encode("utf-8"),
-        message.encode("utf-8"),
-        hashlib.sha256
-    ).hexdigest()
+    return hmac.new(secret.encode(), message.encode(), hashlib.sha256).hexdigest()
 
 # =========================
-# API ERROR HANDLER
-# =========================
-class APIErrorHandler:
-    """Comprehensive API error handling with retry logic."""
-    
-    def __init__(self, max_retries: int = 3, backoff_factor: float = 1.5):
-        self.max_retries = max_retries
-        self.backoff_factor = backoff_factor
-        self.rate_limit_reset_times = {}
-        
-    def should_retry_error(self, error: Exception, http_status: int = None) -> bool:
-        """Determine if an error should be retried."""
-        # Network errors should be retried
-        if isinstance(error, (requests.exceptions.ConnectionError, 
-                             requests.exceptions.Timeout)):
-            return True
-            
-        # Rate limiting should be retried
-        if http_status == 429:
-            return True
-            
-        # Server errors (5xx) should be retried
-        if http_status and 500 <= http_status < 600:
-            return True
-            
-        # Client errors (4xx) typically shouldn't be retried (except 429)
-        if http_status and 400 <= http_status < 500:
-            return False
-            
-        # Other errors
-        if isinstance(error, requests.exceptions.RequestException):
-            return True
-            
-        return False
-    
-    def get_retry_delay(self, attempt: int, http_status: int = None, retry_after: int = None) -> float:
-        """Calculate retry delay with exponential backoff."""
-        if retry_after:
-            # Use server-specified retry time
-            return float(retry_after)
-        elif http_status == 429:
-            # Rate limiting - use exponential backoff
-            return min(30, self.backoff_factor ** attempt + random.uniform(0, 1))
-        else:
-            # Standard exponential backoff with jitter
-            return min(10, self.backoff_factor ** attempt + random.uniform(0, 0.5))
-    
-    def handle_error(self, operation: str, error: Exception, attempt: int, 
-                    http_status: int = None, retry_after: int = None) -> bool:
-        """Handle API error with retry logic."""
-        if attempt >= self.max_retries:
-            print(f"❌ Max retries exceeded for {operation}")
-            return False
-        
-        if not self.should_retry_error(error, http_status):
-            print(f"❌ Non-retryable error for {operation}: {error}")
-            return False
-        
-        delay = self.get_retry_delay(attempt, http_status, retry_after)
-        
-        error_type = "rate limit" if http_status == 429 else "server error" if http_status and http_status >= 500 else "error"
-        print(f"⚠️ {operation} failed ({error_type}, attempt {attempt + 1}/{self.max_retries}): {error}")
-        print(f"   Retrying in {delay:.1f} seconds...")
-        
-        time.sleep(delay)
-        return True
-
-# =========================
-# API RATE LIMITER
+# RATE LIMITER
 # =========================
 class RateLimiter:
-    def __init__(self, calls_per_second: float = 2.0):
-        self.calls_per_second = calls_per_second
+    def __init__(self, calls_per_second=2.0):
         self.min_interval = 1.0 / calls_per_second
-        self.last_call_time = 0
-    
+        self.last = 0
+
     def wait(self):
-        """Wait if necessary to maintain rate limit."""
-        current_time = time.time()
-        elapsed = current_time - self.last_call_time
-        
-        if elapsed < self.min_interval:
-            sleep_time = self.min_interval - elapsed
-            time.sleep(sleep_time)
-        
-        self.last_call_time = time.time()
+        now = time.time()
+        diff = now - self.last
+        if diff < self.min_interval:
+            time.sleep(self.min_interval - diff)
+        self.last = time.time()
 
 # =========================
-# AVERAGING BOT BASED ON OPEN TARGET/STOP ORDERS
+# ERROR HANDLER
+# =========================
+class APIErrorHandler:
+    def __init__(self, retries=3, backoff=1.5):
+        self.retries = retries
+        self.backoff = backoff
+
+    def retry_delay(self, attempt):
+        return min(10, self.backoff ** attempt + random.uniform(0, 0.5))
+
+# =========================
+# BOT
 # =========================
 class AveragingBot:
     def __init__(self):
         load_dotenv()
-        
         self.base_url = "https://fapi.pi42.com"
         self.market_url = "https://api.pi42.com"
-        
+
         self.api_key = os.getenv("PI42_API_KEY")
         self.secret_key = os.getenv("PI42_API_SECRET")
-        
         if not self.api_key or not self.secret_key:
-            raise Exception("❌ API KEYS NOT FOUND - Please check your .env file")
-        
-        # ===== STRATEGY SETTINGS =====
-        self.order_timeout = 300  # 5 minutes order timeout
-        self.max_api_errors = 50  # Increased threshold
-        
-        # ===== STATE MANAGEMENT =====
-        self.order_history = {}  # Track our order history
-        self.last_update_time = datetime.now()
+            raise Exception("API keys missing")
+
+        self.api_limiter = RateLimiter(1.5)
+        self.order_limiter = RateLimiter(0.5)
+        self.error_handler = APIErrorHandler()
+
         self.is_running = True
-        
-        # Statistics
-        self.total_orders_placed = 0
-        self.total_orders_filled = 0
-        self.total_orders_cancelled = 0
-        self.total_pnl = 0
-        
-        # API error tracking
-        self.api_error_count = 0
-        self.consecutive_errors = 0
-        
-        # Initialize balance attributes
-        self.balance = 0.0
-        self.pnl_isolated = 0.0
-        self.pnl_cross = 0.0
-        self.available_balance = 0.0
-        
-        # ===== ERROR HANDLER =====
-        self.error_handler = APIErrorHandler(max_retries=3, backoff_factor=1.5)
-        
-        # ===== RATE LIMITERS =====
-        self.api_limiter = RateLimiter(calls_per_second=1.5)
-        self.order_limiter = RateLimiter(calls_per_second=0.5)
-        
-        # ===== MQTT SETUP =====
-        self.mqtt_client = mqtt.Client(
-            client_id=MQTT_CLIENT_ID,
-            protocol=mqtt.MQTTv311,
-            callback_api_version=mqtt.CallbackAPIVersion.VERSION1,
-        )
-        
-        self.mqtt_client.on_connect = self._on_mqtt_connect
-        self.mqtt_client.on_disconnect = self._on_mqtt_disconnect
-        self._connect_mqtt()
-        
-        # ===== HOME ASSISTANT DISCOVERY =====
-        self.publish_ha_discovery()
-        
-        # ===== SIGNAL HANDLERS =====
-        signal.signal(signal.SIGINT, self._signal_handler)
-        signal.signal(signal.SIGTERM, self._signal_handler)
-        
-        # ===== INITIALIZE =====
-        self._initialize_balance_and_positions()
-        
-        print("\n" + "="*60)
-        print("🚀 PI42 AVERAGING BOT - TARGET ORDER BASED (NO STOP LOSS)")
-        print(f"📅 Start Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"💰 Wallet Balance: {self.balance:.2f} INR")
-        print(f"📈 Total PnL: {self.total_pnl:.2f} INR")
-        print(f"📊 Trading {len(SYMBOL_CONFIG)} symbols")
-        print("="*60 + "\n")
-    
-    def _handle_api_call(self, func, operation_name: str, *args, **kwargs):
-        """Wrapper for API calls with error handling."""
-        for attempt in range(self.error_handler.max_retries + 1):
+        signal.signal(signal.SIGINT, self.stop)
+        signal.signal(signal.SIGTERM, self.stop)
+
+        print("\n🚀 PI42 Averaging Bot Started\n")
+
+    def stop(self, *args):
+        print("Shutting down...")
+        self.is_running = False
+        sys.exit(0)
+
+    # =========================
+    # API WRAPPER
+    # =========================
+    def api_call(self, func, name):
+        for i in range(self.error_handler.retries):
             try:
                 self.api_limiter.wait()
-                result = func(*args, **kwargs)
-                self.consecutive_errors = 0  # Reset on success
-                return result
-            except requests.exceptions.HTTPError as e:
-                http_status = e.response.status_code if hasattr(e, 'response') else None
-                retry_after = int(e.response.headers.get('Retry-After', 0)) if hasattr(e, 'response') else None
-                
-                if not self.error_handler.handle_error(operation_name, e, attempt, http_status, retry_after):
-                    self.api_error_count += 1
-                    self.consecutive_errors += 1
-                    return None
-            except requests.exceptions.RequestException as e:
-                if not self.error_handler.handle_error(operation_name, e, attempt):
-                    self.api_error_count += 1
-                    self.consecutive_errors += 1
-                    return None
+                return func()
             except Exception as e:
-                print(f"❌ Unexpected error in {operation_name}: {e}")
-                self.api_error_count += 1
-                self.consecutive_errors += 1
-                return None
-        
-        self.api_error_count += 1
-        self.consecutive_errors += 1
+                print(f"{name} failed: {e}")
+                time.sleep(self.error_handler.retry_delay(i))
         return None
-    
+
     # =========================
-    # INITIALIZATION
+    # MARKET DATA
     # =========================
-    def _initialize_balance_and_positions(self):
-        """Initialize balance and fetch all positions with retry."""
-        for attempt in range(5):  # More retries for initialization
-            try:
-                print(f"Initializing (attempt {attempt + 1})...")
-                if not self._update_balance():
-                    raise Exception("Failed to fetch balance")
-                
-                # Initialize order history
-                for symbol in SYMBOL_CONFIG.keys():
-                    self.order_history[symbol] = {
-                        "open_orders": [],
-                        "filled_orders": [],
-                        "cancelled_orders": [],
-                        "last_avg_price": None,
-                        "total_quantity": 0,
-                        "avg_entry_price": 0,
-                    }
-                
-                # Fetch and analyze existing orders
-                self.update_order_status()
-                print("✅ Initialization complete")
-                return
-            except Exception as e:
-                if attempt < 4:
-                    print(f"⚠️ Initialization failed (attempt {attempt + 1}): {e}")
-                    time.sleep(3)
-                else:
-                    print(f"❌ Failed to initialize after 5 attempts: {e}")
-                    raise
-    
+    def fetch_ltp(self, symbol):
+        def f():
+            r = requests.post(f"{self.market_url}/v1/market/klines",
+                              json={"pair": symbol, "interval": "1m", "limit": 1}, timeout=10)
+            r.raise_for_status()
+            return float(r.json()[-1]["close"])
+        return self.api_call(f, "LTP")
+
     # =========================
-    # OPEN ORDERS MANAGEMENT
+    # POSITION
     # =========================
-    def fetch_open_orders(self, symbol: str = None) -> List[Dict]:
-        """Fetch open orders from PI42 API with error handling."""
-        
-        def _fetch():
-            timestamp = str(int(time.time() * 1000))
-            params = {"timestamp": timestamp}
-            signature = generate_signature(self.secret_key, f"timestamp={timestamp}")
-            
-            headers = {
-                'api-key': self.api_key,
-                'signature': signature,
-            }
-            
-            open_orders_url = f"{self.base_url}/v1/order/open-orders"
-            response = requests.get(open_orders_url, headers=headers, params=params, timeout=15)
-            response.raise_for_status()
-            
-            if response.status_code == 200:
-                response_data = response.json()
-                if symbol:
-                    filtered_orders = []
-                    for order in response_data:
-                        if order.get("symbol") == symbol:
-                            filtered_orders.append(order)
-                    return filtered_orders
-                else:
-                    return response_data
-            elif response.status_code == 404:
-                return []
-            else:
-                response.raise_for_status()
-        
-        result = self._handle_api_call(_fetch, "fetch_open_orders")
-        if result is None:
-            print(f"⚠️ Failed to fetch open orders after retries")
-            return []  # Return empty list on complete failure
-        return result
-    
-    def analyze_open_orders(self, symbol: str, open_orders: List[Dict]) -> Dict:
-        """Analyze open orders for averaging strategy."""
-        buy_limit_orders = []
-        take_profit_orders = []
-        
-        print(f"\n🔍 Analyzing {len(open_orders)} open orders for {symbol}:")
-        
-        for order in open_orders:
-            if order.get("symbol") != symbol:
-                continue
-            
-            order_type = order.get("type", "").upper()
-            side = order.get("side", "").upper()
-            
-            # Safely handle price (could be None for market orders)
-            price_str = order.get("price")
-            price = float(price_str) if price_str is not None else 0.0
-            
-            # Safely handle stop price (could be None for limit orders)
-            stop_price_str = order.get("stopPrice")
-            stop_price = float(stop_price_str) if stop_price_str is not None else 0.0
-            
-            if side == "BUY":
-                if order_type == "LIMIT":
-                    order_amount_str = order.get("orderAmount", "0")
-                    filled_amount_str = order.get("filledAmount", "0")
-                    
-                    buy_limit_orders.append({
-                        "order_id": order.get("clientOrderId") or order.get("linkId"),
-                        "price": price,
-                        "quantity": float(order_amount_str) if order_amount_str else 0.0,
-                        "filled": float(filled_amount_str) if filled_amount_str else 0.0,
-                        "time": order.get("time", ""),
-                        "status": order.get("status", ""),
-                    })
-            elif side == "SELL":
-                if stop_price > 0:
-                    order_amount_str = order.get("orderAmount", "0")
-                    
-                    order_data = {
-                        "order_id": order.get("clientOrderId") or order.get("linkId"),
-                        "trigger_price": stop_price,
-                        "price": price,
-                        "quantity": float(order_amount_str) if order_amount_str else 0.0,
-                        "order_type": order_type,
-                    }
-                    print(f"   Detected SELL order: {order_data}")
-                    if "STOP_LIMIT" in order_type or "LIMIT" in order_type:
-                        take_profit_orders.append(order_data)
-        
-        return {
-            "buy_limits": buy_limit_orders,
-            "take_profits": take_profit_orders,
-            "has_position": len(take_profit_orders) > 0,
-        }
-    
-    def get_lowest_take_profit_price(self, take_profit_orders: List[Dict]) -> Optional[float]:
-        """Get the lowest take profit price from open orders."""
-        if not take_profit_orders:
+    def get_position(self, symbol):
+        def f():
+            ts = str(int(time.time() * 1000))
+            q = f"symbol={symbol}&timestamp={ts}&pageSize=10"
+            sig = generate_signature(self.secret_key, q)
+            h = {"api-key": self.api_key, "signature": sig}
+            r = requests.get(f"{self.base_url}/v1/positions/OPEN", headers=h,
+                             params={"symbol": symbol, "timestamp": ts, "pageSize": 10})
+            r.raise_for_status()
+            for p in r.json():
+                if p["contractPair"] == symbol and float(p["quantity"]) > 0:
+                    return float(p["quantity"]), float(p["entryPrice"])
             return None
-        
-        try:
-            valid_orders = [order for order in take_profit_orders 
-                           if order.get("trigger_price") and order["trigger_price"] > 0]
-            
-            if not valid_orders:
-                return None
-            
-            lowest_tp = min(valid_orders, key=lambda x: x["trigger_price"])
-            return lowest_tp["trigger_price"]
-        except Exception as e:
-            print(f"⚠️ Error finding lowest TP price: {e}")
-            return None
-    
-    def should_place_averaging_order(self, symbol: str, ltp: float, 
-                                     lowest_tp_price: Optional[float],
-                                     has_position: bool) -> Tuple[bool, float, bool]:
-        """Determine if we should place an averaging order."""
-        cfg = SYMBOL_CONFIG[symbol]
-        avg_percent = cfg["avg_percent"]
-        
-        if has_position and lowest_tp_price is None:
-            print(f"⚠️ {symbol}: Has position but no TP orders. Creating TP only...")
-            return False, ltp, True
-        
-        if lowest_tp_price is None:
-            print(f"💰 {symbol}: No position or TP orders, placing market order")
-            return True, ltp, False
-        
-        target_price = lowest_tp_price * (1 - avg_percent / 100)
-        current_drop = ((lowest_tp_price - ltp) / lowest_tp_price) * 100
-        
-        if current_drop > avg_percent:
-            print(f"📉 {symbol}: LTP dropped {current_drop:.2f}% from TP {lowest_tp_price:.2f}")
-            return True, target_price, False
-        
-        needed_drop = avg_percent - current_drop
-        print(f"🎯 {symbol}: Close to target ({needed_drop:.2f}% more needed)")
-        
-        return False, target_price, False
-    
+        return self.api_call(f, "Position")
+
     # =========================
-    # ORDER MANAGEMENT - MODIFIED FOR PRICE PRECISION
+    # ORDER
     # =========================
-    def format_price(self, price: float, symbol: str) -> float:
-        """Format price according to symbol's price precision."""
-        cfg = SYMBOL_CONFIG.get(symbol, {})
-        price_precision = cfg.get("price_precision", 0)
-        
-        # Round to the specified decimal places
-        formatted_price = round(price, price_precision)
-        
-        # For integer prices (precision 0), convert to int
-        if price_precision == 0:
-            formatted_price = int(formatted_price)
-        
-        return formatted_price
-    
-    def calculate_take_profit_price(self, symbol: str, entry_price: float) -> float:
-        """Calculate take profit price with proper formatting."""
-        cfg = SYMBOL_CONFIG.get(symbol, {})
-        target_percent = cfg.get("target_percent", 1.0) / 100
-        
-        tp_price = entry_price * (1 + target_percent)
-        tp_price_formatted = self.format_price(tp_price, symbol)
-        
-        return tp_price_formatted
-    
-    def place_market_order_with_tp(self, symbol: str, qty: float, price: float) -> Optional[str]:
-        """Place a MARKET order with take profit only (no stop loss)."""
-        self.order_limiter.wait()
-        
-        def _place_order():
-            cfg = SYMBOL_CONFIG.get(symbol, {})
-            qty_precision = cfg.get("qty_precision", 3)
-            formatted_qty = round(qty, qty_precision)
-            timestamp = str(int(time.time() * 1000))
-            
+    def format_price(self, price, symbol):
+        return round(price, SYMBOL_CONFIG[symbol]["price_precision"])
+
+    def place_market(self, symbol, qty):
+        def f():
+            ts = str(int(time.time() * 1000))
             payload = {
-                "timestamp": timestamp,
+                "timestamp": ts,
                 "placeType": "ORDER_FORM",
-                "quantity": formatted_qty,
+                "quantity": qty,
                 "side": "BUY",
                 "symbol": symbol,
                 "type": "MARKET",
                 "marginAsset": "INR",
                 "deviceType": "WEB",
                 "timeInForce": "GTC",
-                "reduceOnly": False,
             }
-            
-            print(f"\n📤 Placing MARKET order for {symbol}:")
-            print(f"   Type: MARKET BUY")
-            print(f"   Qty: {formatted_qty}")
-            print(f"   Qty Precision: {qty_precision}")
-            print(f"   Price Precision: {cfg.get('price_precision', 0)}")
-            
-            signature = generate_signature(
-                self.secret_key, json.dumps(payload, separators=(",", ":"))
-            )
-            
-            headers = {
-                "api-key": self.api_key,
-                "signature": signature,
-                "Content-Type": "application/json"
-            }
-            
-            res = requests.post(
-                f"{self.base_url}/v1/order/place-order",
-                json=payload,
-                headers=headers,
-                timeout=15
-            )
-            res.raise_for_status()
-            return res
-        
-        try:
-            res = self._handle_api_call(_place_order, "place_market_order")
-            if res is None:
-                print(f"❌ Failed to place market order for {symbol} after retries")
-                return None
-            
-            if res.status_code == 201:
-                data = res.json()
-                order_id = data.get("orderId") or data.get("clientOrderId")
-                timestamp = str(int(time.time() * 1000))
-                filled_price = float(data.get("price", 0)) if data.get("price") else 0
-                cfg = SYMBOL_CONFIG.get(symbol, {})
-                qty_precision = cfg.get("qty_precision", 3)
-                formatted_qty = round(qty, qty_precision)
-                
-                print(f"✅ {symbol} MARKET ORDER PLACED")
-                print(f"   Order ID: {order_id}")
-                print(f"   Filled at: {filled_price:.{cfg.get('price_precision', 0)}f}")
-                
-                if filled_price > 0:
-                    self.place_take_profit_order_with_retry(symbol, formatted_qty, filled_price)
-                
-                order_info = {
-                    "order_id": order_id,
-                    "symbol": symbol,
-                    "type": "MARKET_BUY",
-                    "quantity": formatted_qty,
-                    "timestamp": timestamp,
-                    "status": "FILLED" if filled_price > 0 else "OPEN",
-                    "filled_price": filled_price,
-                    "reduceOnly": True,
-                }
-                
-                self.order_history[symbol]["filled_orders"].append(order_info)
-                self.total_orders_placed += 1
-                self.total_orders_filled += 1
-                return order_id
-            else:
-                error_data = res.json() if res.content else {}
-                print(f"❌ {symbol} Order failed: {res.status_code}")
-                print(f"   Error: {error_data}")
-                return None
-                
-        except Exception as e:
-            print(f"❌ {symbol} Order error: {e}")
-            return None
-    
-    def place_take_profit_order_with_retry(self, symbol: str, qty: float, entry_price: float) -> bool:
-        """Place a take profit order with retry logic and proper price formatting."""
-        
-        def _place_tp():
-            cfg = SYMBOL_CONFIG.get(symbol, {})
-            timestamp = str(int(time.time() * 1000))
-            price_precision = cfg.get("price_precision", 0)
-            
-            # Calculate and format TP price
-            target_percent = cfg.get("target_percent", 1.0) / 100
-            tp_price = entry_price * (1 + target_percent)
-            tp_price_formatted = self.format_price(tp_price, symbol)
-            
-            if tp_price_formatted <= 0:
-                tp_price_formatted = max(1, self.format_price(entry_price * 1.01, symbol))
-            
-            print(f"   Placing TP @ {tp_price_formatted:.{price_precision}f}")
-            print(f"   Entry price: {entry_price:.{price_precision}f}")
-            print(f"   Price precision: {price_precision}")
-            
+            sig = generate_signature(self.secret_key, json.dumps(payload, separators=(",", ":")))
+            h = {"api-key": self.api_key, "signature": sig, "Content-Type": "application/json"}
+            r = requests.post(f"{self.base_url}/v1/order/place-order", json=payload, headers=h)
+            r.raise_for_status()
+            return r.json()
+        return self.api_call(f, "Market Order")
+
+    def place_tp(self, symbol, qty, entry):
+        def f():
+            ts = str(int(time.time() * 1000))
+            tp = self.format_price(entry * 1.01, symbol)
             payload = {
-                "timestamp": timestamp,
+                "timestamp": ts,
                 "placeType": "ORDER_FORM",
                 "quantity": qty,
                 "side": "SELL",
                 "symbol": symbol,
                 "type": "STOP_LIMIT",
-                "stopPrice": tp_price_formatted,
-                "price": tp_price_formatted,
+                "stopPrice": tp,
+                "price": tp,
                 "marginAsset": "INR",
                 "deviceType": "WEB",
                 "timeInForce": "GTC",
                 "reduceOnly": True,
             }
-            
-            signature = generate_signature(
-                self.secret_key, json.dumps(payload, separators=(",", ":"))
-            )
-            
-            headers = {
-                "api-key": self.api_key,
-                "signature": signature,
-                "Content-Type": "application/json"
-            }
-            
-            res = requests.post(
-                f"{self.base_url}/v1/order/place-order",
-                json=payload,
-                headers=headers,
-                timeout=15
-            )
-            res.raise_for_status()
-            return res
-        
-        try:
-            res = self._handle_api_call(_place_tp, "place_tp_order")
-            if res is None:
-                print(f"❌ Failed to place TP order for {symbol} after retries")
-                return False
-            
-            if res.status_code == 201:
-                print(f"   ✅ TP order placed")
-                return True
-            else:
-                print(f"   ❌ TP order failed: {res.status_code}")
-                if res.content:
-                    try:
-                        error_data = res.json()
-                        print(f"   Error details: {error_data}")
-                    except:
-                        print(f"   Response: {res.text[:200]}")
-                return False
-                
-        except Exception as e:
-            print(f"   ❌ TP order error: {e}")
-            return False
-    
-    def create_tp_for_existing_position(self, symbol: str, position_qty: float, entry_price: float) -> bool:
-        """Create TP order only for an existing position."""
-        cfg = SYMBOL_CONFIG.get(symbol, {})
-        price_precision = cfg.get("price_precision", 0)
-        
-        print(f"\n🎯 Creating TP for existing {symbol} position:")
-        print(f"   Position: {position_qty:.{cfg.get('qty_precision', 3)}f} @ {entry_price:.{price_precision}f}")
-        print(f"   Price precision: {price_precision}")
-        
-        success = self.place_take_profit_order_with_retry(symbol, position_qty, entry_price)
-        
-        if success:
-            print(f"✅ Successfully created TP order for {symbol}")
+            sig = generate_signature(self.secret_key, json.dumps(payload, separators=(",", ":")))
+            h = {"api-key": self.api_key, "signature": sig, "Content-Type": "application/json"}
+            r = requests.post(f"{self.base_url}/v1/order/place-order", json=payload, headers=h)
+            r.raise_for_status()
             return True
-        else:
-            print(f"❌ Failed to create TP order for {symbol}")
-            return False
-    
-    # =========================
-    # POSITION MANAGEMENT
-    # =========================
-    def get_position(self, symbol: str) -> Optional[Dict]:
-        """Fetch position from API with error handling."""
-        
-        def _fetch_position():
-            timestamp = str(int(time.time() * 1000))
-            params = {"symbol": symbol, "timestamp": timestamp, "pageSize": 10}
-            query = "&".join(f"{k}={v}" for k, v in params.items())
-            signature = generate_signature(self.secret_key, query)
-            
-            headers = {
-                "api-key": self.api_key,
-                "signature": signature,
-                "Content-Type": "application/json"
-            }
-            
-            res = requests.get(
-                f"{self.base_url}/v1/positions/OPEN",
-                headers=headers,
-                params=params,
-                timeout=15
-            )
-            res.raise_for_status()
-            return res
-        
-        try:
-            res = self._handle_api_call(_fetch_position, "get_position")
-            if res is None:
-                print(f"⚠️ Failed to fetch position for {symbol} after retries")
-                return None
-            
-            if res.status_code == 200:
-                positions = res.json()
-                for pos in positions:
-                    if pos.get("contractPair") == symbol and float(pos.get("quantity", 0)) > 0:
-                        return {
-                            "quantity": float(pos.get("quantity", 0)),
-                            "entry_price": float(pos.get("entryPrice", 0)),
-                            "unrealized_pnl": float(pos.get("unrealisedPnl", 0)),
-                        }
-                return None
-            else:
-                print(f"⚠️ Failed to fetch position for {symbol}: {res.status_code}")
-                return None
-                
-        except Exception as e:
-            print(f"⚠️ Position API error for {symbol}: {e}")
-            return None
-    
-    # =========================
-    # MARKET DATA
-    # =========================
-    def fetch_ltp(self, symbol: str) -> float:
-        """Fetch Last Traded Price with error handling."""
-        
-        def _fetch_ltp():
-            res = requests.post(
-                f"{self.market_url}/v1/market/klines",
-                json={"pair": symbol, "interval": "1m", "limit": 1},
-                timeout=10
-            )
-            res.raise_for_status()
-            return res
-        
-        try:
-            res = self._handle_api_call(_fetch_ltp, "fetch_ltp")
-            if res is None:
-                raise Exception(f"Failed to fetch LTP for {symbol} after retries")
-            
-            data = res.json()
-            if not data:
-                raise ValueError(f"No LTP data for {symbol}")
-            
-            ltp = float(data[-1]["close"])
-            return ltp
-            
-        except Exception as e:
-            print(f"⚠️ LTP fetch error for {symbol}: {e}")
-            raise
-    
-    # =========================
-    # BALANCE MANAGEMENT
-    # =========================
-    def _update_balance(self) -> bool:
-        """Fetch and update balance information."""
-        try:
-            bal = self.get_user_balance_with_retry()
-            if bal is None:
-                print("⚠️ Failed to update balance, using cached values")
-                if hasattr(self, 'balance'):
-                    return False
-                else:
-                    raise Exception("No cached balance available")
-            
-            self.balance = bal["inr_balance"]
-            self.pnl_isolated = bal["pnl_isolated"]
-            self.pnl_cross = bal["pnl_cross"]
-            self.total_pnl = self.pnl_isolated + self.pnl_cross
-            self.available_balance = max(0, self.balance + (self.pnl_isolated))
-            self.last_update_time = datetime.now()
-            return True
-            
-        except Exception as e:
-            print(f"⚠️ Failed to update balance: {e}")
-            if hasattr(self, 'balance'):
-                print(f"   Using cached balance: {self.balance:.2f} INR")
-                return False
-            else:
-                raise
-    
-    def get_user_balance_with_retry(self) -> Optional[Dict]:
-        """Fetch user balance with retry logic."""
-        
-        def _fetch_balance():
-            timestamp = str(int(time.time() * 1000))
-            query = f"marginAsset=INR&timestamp={timestamp}"
-            signature = generate_signature(self.secret_key, query)
-            
-            headers = {
-                "api-key": self.api_key,
-                "signature": signature,
-                "Content-Type": "application/json"
-            }
-            
-            res = requests.get(
-                f"{self.base_url}/v1/wallet/futures-wallet/details",
-                headers=headers,
-                params={"marginAsset": "INR", "timestamp": timestamp},
-                timeout=15
-            )
-            res.raise_for_status()
-            return res
-        
-        try:
-            res = self._handle_api_call(_fetch_balance, "get_balance")
-            if res is None:
-                return None
-            
-            data = res.json()
-            return {
-                "inr_balance": float(data.get("inrBalance", 0)),
-                "pnl_isolated": float(data.get("unrealisedPnlIsolated", 0)),
-                "pnl_cross": float(data.get("unrealisedPnlCross", 0)),
-            }
-            
-        except Exception as e:
-            print(f"⚠️ Balance API error: {e}")
-            return None
-    
-    # =========================
-    # MQTT HANDLERS
-    # =========================
-    def _connect_mqtt(self):
-        """Connect to MQTT broker with retry."""
-        max_retries = 5
-        for attempt in range(max_retries):
-            try:
-                self.mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
-                self.mqtt_client.loop_start()
-                print(f"✅ Connected to MQTT broker")
-                return
-            except Exception as e:
-                print(f"❌ MQTT connection failed (attempt {attempt + 1}): {e}")
-                if attempt < max_retries - 1:
-                    time.sleep(5)
-                else:
-                    print("⚠️ Continuing without MQTT...")
-    
-    def _on_mqtt_connect(self, client, userdata, flags, rc):
-        if rc == 0:
-            print("✅ MQTT connection established")
-        else:
-            print(f"❌ MQTT connection failed with code {rc}")
-    
-    def _on_mqtt_disconnect(self, client, userdata, rc):
-        print(f"⚠️ MQTT disconnected (rc={rc})")
-    
-    def _signal_handler(self, signum, frame):
-        """Handle shutdown signals gracefully."""
-        print(f"\n⚠️ Received signal {signum}, shutting down gracefully...")
-        self.is_running = False
-        time.sleep(1)
-        self.mqtt_client.loop_stop()
-        self.mqtt_client.disconnect()
-        sys.exit(0)
-    
-    # =========================
-    # HOME ASSISTANT DISCOVERY
-    # =========================
-    def publish_ha_discovery(self):
-        """Publish Home Assistant MQTT discovery topics."""
-        device = {
-            "identifiers": [DEVICE_ID],
-            "name": "PI42 Averaging Bot",
-            "manufacturer": "PI42",
-            "model": "Averaging Bot",
-            "sw_version": "1.0",
-        }
-        
-        sensors = [
-            ("wallet_balance", "PI42 Wallet Balance", "INR", "mdi:wallet"),
-            ("pnl_isolated", "PI42 Isolated PnL", "INR", "mdi:chart-line"),
-            ("total_pnl", "PI42 Total PnL", "INR", "mdi:chart-arc"),
-            ("available_balance", "PI42 Available Balance", "INR", "mdi:cash"),
-            ("total_orders", "PI42 Total Orders", "count", "mdi:order-bool-ascending"),
-            ("open_orders", "PI42 Open Orders", "count", "mdi:timer-sand"),
-            ("filled_orders", "PI42 Filled Orders", "count", "mdi:order-bool-descending"),
-            ("cancelled_orders", "PI42 Cancelled Orders", "count", "mdi:close-circle"),
-        ]
-        
-        for key, name, unit, icon in sensors:
-            topic = f"{HA_PREFIX}/sensor/{DEVICE_ID}_{key}/config"
-            payload = {
-                "name": name,
-                "state_topic": STATE_TOPIC,
-                "value_template": f"{{{{ value_json.{key} }}}}",
-                "unit_of_measurement": unit,
-                "unique_id": f"{DEVICE_ID}_{key}",
-                "icon": icon,
-                "device": device,
-            }
-            
-            try:
-                self.mqtt_client.publish(topic, json.dumps(payload), qos=1, retain=True)
-                time.sleep(0.1)
-            except Exception as e:
-                print(f"⚠️ Failed to publish HA discovery for {key}: {e}")
-    
-    def publish_mqtt_status(self):
-        """Publish status to MQTT."""
-        total_open_orders = sum(len(history["open_orders"]) for history in self.order_history.values())
-        total_filled_orders = sum(len(history["filled_orders"]) for history in self.order_history.values())
-        total_cancelled_orders = sum(len(history["cancelled_orders"]) for history in self.order_history.values())
-        
-        payload = {
-            "wallet_balance": round(self.balance, 2),
-            "pnl_isolated": round(self.pnl_isolated, 2),
-            "total_pnl": round(self.total_pnl, 2),
-            "available_balance": round(self.available_balance, 2),
-            "total_orders": self.total_orders_placed,
-            "open_orders": total_open_orders,
-            "filled_orders": total_filled_orders,
-            "cancelled_orders": total_cancelled_orders,
-            "timestamp": int(time.time()),
-            "last_update": self.last_update_time.strftime("%Y-%m-%d %H:%M:%S"),
-            "api_errors": self.api_error_count,
-            "consecutive_errors": self.consecutive_errors,
-        }
-        
-        try:
-            self.mqtt_client.publish(
-                STATE_TOPIC,
-                json.dumps(payload),
-                qos=1,
-                retain=False,
-            )
-        except Exception as e:
-            print(f"⚠️ MQTT publish failed: {e}")
-    
-    # =========================
-    # ORDER TRACKING
-    # =========================
-    def update_order_status(self):
-        """Update order status from API."""
-        for symbol in SYMBOL_CONFIG.keys():
-            try:
-                open_orders = self.fetch_open_orders(symbol)
-                if open_orders is None:
-                    print(f"⚠️ Skipping order status update for {symbol} due to API error")
-                    continue
-                    
-                api_order_ids = set()
-                for order in open_orders:
-                    order_id = order.get("clientOrderId") or order.get("linkId")
-                    if order_id:
-                        api_order_ids.add(order_id)
-                
-                for order in list(self.order_history[symbol]["open_orders"]):
-                    order_id = order["order_id"]
-                    if order_id not in api_order_ids:
-                        print(f"✅ {symbol}: Order {order_id} not found in API, marking as filled")
-                        order["status"] = "FILLED"
-                        self.order_history[symbol]["filled_orders"].append(order)
-                        self.order_history[symbol]["open_orders"].remove(order)
-                        self.total_orders_filled += 1
-                
-            except Exception as e:
-                print(f"⚠️ Error updating order status for {symbol}: {e}")
-    
+        return self.api_call(f, "TP Order")
+
     # =========================
     # MAIN LOOP
     # =========================
     def run(self):
-        """Main trading loop."""
-        iteration = 0
-        
-        print("="*60)
-        print("Starting AVERAGING BOT - Market Orders Only")
-        print("Strategy: Place market order when price drops 2% below lowest TP")
-        print("Or create TP for existing positions without TP orders (NO STOP LOSS)")
-        print("="*60 + "\n")
-        
         while self.is_running:
-            try:
-                iteration += 1
-                current_time = datetime.now()
-                
-                # Check for excessive errors
-                if self.consecutive_errors > 20:
-                    print(f"⚠️ Too many consecutive errors ({self.consecutive_errors}), waiting 30 seconds...")
-                    time.sleep(30)
-                    self.consecutive_errors = 0
-                    continue
-                
-                print(f"🔄 Iteration {iteration} - {current_time.strftime('%Y-%m-%d %H:%M:%S')}")
-                
-                # Update order status
-                self.update_order_status()
-                time.sleep(1)
-                
-                # Update balance and publish status
-                if not self._update_balance():
-                    print("⚠️ Using cached balance due to update failure")
-                
-                self.publish_mqtt_status()
-                
-                print(f"💰 Balance: {self.balance:.2f} INR | "
-                      f"Available: {self.available_balance:.2f} INR | "
-                      f"Total PnL: {self.total_pnl:+.2f} INR")
-                print(f"📊 API Errors: {self.api_error_count} | "
-                      f"Consecutive Errors: {self.consecutive_errors}")
-                
-                # Process each symbol
-                for symbol, cfg in SYMBOL_CONFIG.items():
-                    try:
-                        qty = cfg["qty"]
-                        price_precision = cfg.get("price_precision", 0)
-                        
-                        # Fetch market data
-                        try:
-                            ltp = self.fetch_ltp(symbol)
-                            time.sleep(0.5)
-                        except Exception as e:
-                            print(f"⚠️ Failed to fetch LTP for {symbol}: {e}")
-                            continue
-                        
-                        # Fetch position
-                        position = self.get_position(symbol)
-                        has_position = position is not None and position["quantity"] > 0
-                        time.sleep(0.5)
-                        
-                        # Fetch and analyze open orders
-                        open_orders = self.fetch_open_orders(symbol)
-                        if open_orders is None:
-                            print(f"⚠️ Skipping {symbol} due to API error fetching orders")
-                            continue
-                        
-                        order_analysis = self.analyze_open_orders(symbol, open_orders)
-                        lowest_tp_price = self.get_lowest_take_profit_price(
-                            order_analysis["take_profits"]
-                        )
-                        
-                        should_place, target_price, create_tp_only = self.should_place_averaging_order(
-                            symbol, ltp, lowest_tp_price, has_position
-                        )
-                        
-                        # Display status with proper precision
-                        position_qty = position["quantity"] if position else 0
-                        position_avg = position["entry_price"] if position else 0
-                        
-                        status_line = (
-                            f"\n📊 {symbol} Status:\n"
-                            f"   LTP: {ltp:.{price_precision}f}\n"
-                            f"   Price Precision: {price_precision}\n"
-                            f"   Qty Precision: {cfg.get('qty_precision', 3)}\n"
-                        )
-                        
-                        if position_qty > 0:
-                            status_line += f"   Position: {position_qty:.{cfg.get('qty_precision', 3)}f} @ {position_avg:.{price_precision}f}\n"
-                        else:
-                            status_line += f"   Position: None\n"
-                        
-                        if lowest_tp_price:
-                            current_drop = ((lowest_tp_price - ltp) / lowest_tp_price) * 100
-                            status_line += f"   Lowest TP: {lowest_tp_price:.{price_precision}f}\n"
-                            status_line += f"   Current drop from TP: {current_drop:.2f}%\n"
-                            status_line += f"   Target drop needed: {cfg['avg_percent']}%\n"
-                        else:
-                            if has_position:
-                                status_line += f"   Has position but no TP orders\n"
-                            else:
-                                status_line += f"   No position or TP orders found\n"
-                        
-                        status_line += f"   Should place market order: {should_place}"
-                        if create_tp_only:
-                            status_line += f"\n   Will create TP only (no stop loss)"
-                        
-                        print(status_line)
-                        
-                        # Handle different scenarios
-                        if create_tp_only:
-                            print(f"\n🎯 Creating TP for existing {symbol} position...")
-                            success = self.create_tp_for_existing_position(
-                                symbol, position_qty, position_avg
-                            )
-                            if success:
-                                print(f"✅ TP created for {symbol}")
-                            else:
-                                print(f"❌ Failed to create TP for {symbol}")
-                        
-                        elif should_place:
-                            print(f"\n🎯 {symbol}: Placing MARKET order with TP only")
-                            order_id = self.place_market_order_with_tp(symbol, qty, ltp)
-                            if order_id:
-                                print(f"✅ Market order placed successfully!")
-                                time.sleep(2)
-                        
-                        else:
-                            if lowest_tp_price and has_position:
-                                current_drop = ((lowest_tp_price - ltp) / lowest_tp_price) * 100
-                                needed_drop = cfg["avg_percent"] - current_drop
-                                if needed_drop > 0:
-                                    print(f"⏳ {symbol}: Need {needed_drop:.2f}% more drop to place market order")
-                            elif has_position:
-                                print(f"✅ {symbol}: Position with TP active (no stop loss)")
-                            else:
-                                print(f"⏳ {symbol}: No position, waiting for conditions...")
-                        
-                        time.sleep(0.5)
-                        
-                    except Exception as e:
-                        print(f"❌ Error processing {symbol}: {e}")
-                        traceback.print_exc()
-                        continue
-                
-                wait_time = 3
-                print(f"\n⏳ Waiting {wait_time} seconds until next update...")
-                for i in range(wait_time):
-                    if not self.is_running:
-                        break
-                    time.sleep(1)
-                    
-            except KeyboardInterrupt:
-                print("\n⚠️ Bot stopped by user")
-                self.is_running = False
-                break
-                
-            except Exception as e:
-                print(f"\n❌ Critical error in iteration {iteration}: {e}")
-                traceback.print_exc()
-                time.sleep(30)
+            for symbol, cfg in SYMBOL_CONFIG.items():
+                try:
+                    ltp = self.fetch_ltp(symbol)
+                    pos = self.get_position(symbol)
 
-# =========================
-# START
-# =========================
+                    print(f"\n{symbol} LTP: {ltp}")
+
+                    if pos:
+                        qty, entry = pos
+                        print(f"Position {qty} @ {entry}")
+                        self.place_tp(symbol, qty, entry)
+                    else:
+                        print("No position, placing buy")
+                        self.place_market(symbol, cfg["qty"])
+
+                    time.sleep(1)
+
+                except Exception as e:
+                    print(f"{symbol} error:", e)
+
+            print("---- Next Cycle ----")
+            time.sleep(5)
+
+
 if __name__ == "__main__":
-    try:
-        bot = AveragingBot()
-        bot.run()
-    except Exception as e:
-        print(f"❌ Failed to start bot: {e}")
-        traceback.print_exc()
-        sys.exit(1)
+    AveragingBot().run()
