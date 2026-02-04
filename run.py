@@ -20,7 +20,7 @@ SYMBOL_CONFIG = {
     "XAGINR": {
         "qty": 1,
         "price_precision": 0,
-        "qty_precision": 1,
+        "qty_precision": 3,
         "avg_percent": 2,
         "target_percent": 1.0,
     },
