@@ -25,7 +25,7 @@ SYMBOL_CONFIG = {
         "target_percent": 1.0,
     },
     "XAUINR": {
-        "qty": 0.005,
+        "qty": 0.01,
         "price_precision": 0,
         "qty_precision": 3,
         "avg_percent": 2,
