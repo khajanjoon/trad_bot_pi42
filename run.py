@@ -31,7 +31,21 @@ SYMBOL_CONFIG = {
         "avg_percent": 2,
         "target_percent": 1.0,
     },
-   
+    "XPDINR": {
+        "qty": 0.033,
+        "price_precision": 0,
+        "qty_precision": 3,
+        "avg_percent": 2,
+        "target_percent": 1.0,
+    },
+    "XPTINR": {
+        "qty": 0.027,
+        "price_precision": 0,
+        "qty_precision": 3,
+        "avg_percent": 2,
+        "target_percent": 1.0,
+    },
+
 }
 
 # =========================
