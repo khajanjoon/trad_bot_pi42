@@ -1,6 +1,4 @@
 asyncio
 aiohttp
-icecream
 requests
 python-dotenv
-scipy
