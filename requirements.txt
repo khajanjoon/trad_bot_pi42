@@ -1,5 +1,3 @@
-# Example dependencies
-python-socketio
 asyncio
 aiohttp
 icecream
