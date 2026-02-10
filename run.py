@@ -46,7 +46,7 @@ SYMBOL_CONFIG = {
         "target_percent": 1.0,
     },
      "INTCINR": {
-        "qty": 1.0,
+        "qty": 1.00,
         "price_precision": 0,
         "qty_precision": 2,
         "avg_percent": 2,
