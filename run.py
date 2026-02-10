@@ -45,19 +45,19 @@ SYMBOL_CONFIG = {
         "avg_percent": 2,
         "target_percent": 1.0,
     },
-     "INTCINR": {
+     "HOODINR": {
         "qty": 1,
         "price_precision": 0,
         "qty_precision": 2,
-        "avg_percent": 2,
-        "target_percent": 1.0,
+        "avg_percent": 5,
+        "target_percent": 2.5,
     },
      "AMZNINR": {
         "qty": 0.20,
         "price_precision": 0,
         "qty_precision": 2,
-        "avg_percent": 2,
-        "target_percent": 1.0,
+        "avg_percent": 5,
+        "target_percent": 2.5,
     },
 
 }
