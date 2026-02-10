@@ -48,14 +48,14 @@ SYMBOL_CONFIG = {
      "INTCINR": {
         "qty": 1.00,
         "price_precision": 0,
-        "qty_precision": 2,
+        "qty_precision": 4,
         "avg_percent": 2,
         "target_percent": 1.0,
     },
      "AMZNINR": {
         "qty": 0.20,
         "price_precision": 0,
-        "qty_precision": 2,
+        "qty_precision": 3,
         "avg_percent": 2,
         "target_percent": 1.0,
     },
